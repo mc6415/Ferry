@@ -1,0 +1,91 @@
+name: Build & release
+
+# Every push to main builds Linux + Windows installers and publishes them to the release for the
+# version in src-tauri/tauri.conf.json (e.g. v0.1.0). Pushing again refreshes that release;
+# bumping the version creates a new one.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A newer push supersedes a build that's still running.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: echo "tag=v$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      # If this version was already released, point its tag at this commit and clear the old
+      # files so the build jobs can upload fresh ones.
+      - name: Refresh existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            git tag -f "$TAG"
+            git push -f origin "refs/tags/$TAG"
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r asset; do
+              gh release delete-asset "$TAG" "$asset" --yes
+            done
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Run tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: Steam Sharing ${{ needs.prepare.outputs.tag }}
+          releaseBody: |
+            Built from ${{ github.sha }}.
+
+            - **Windows:** `.msi` or `-setup.exe`
+            - **Linux:** `.AppImage` (any distro), `.deb` (Debian/Ubuntu) or `.rpm` (Fedora)
+          releaseDraft: false
+          prerelease: false

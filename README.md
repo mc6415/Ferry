@@ -37,4 +37,11 @@ npm run tauri build
 
 Build on each OS you want a binary for (Linux → `.deb`/`.rpm`/AppImage, Windows → `.msi`/`.exe`).
 Windows needs the WebView2 runtime (preinstalled on Windows 10/11) and the MSVC build tools.
-For automated builds of both, the `tauri-apps/tauri-action` GitHub Action works well.
+
+## Releases
+
+Every push to `main` builds Linux and Windows installers with GitHub Actions
+(`.github/workflows/release.yml`) and publishes them to the release for the current version
+(`v` + `version` in `src-tauri/tauri.conf.json`). Pushing again replaces that release's files.
+To start a new release, bump `version` in `src-tauri/tauri.conf.json` (and ideally
+`src-tauri/Cargo.toml` / `package.json` to match).
