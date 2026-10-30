@@ -1,0 +1,455 @@
+//! Copies game folders + manifests from a source `steamapps` into a local library.
+
+use crate::steam::{self, Manifest};
+use filetime::FileTime;
+use serde::Serialize;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const BUF_SIZE: usize = 4 * 1024 * 1024;
+const WORKERS: usize = 4;
+const PARTIAL_SUFFIX: &str = ".sscopy-partial";
+/// SMB and FAT round timestamps, so allow some slack when deciding a file is unchanged.
+const MTIME_SLACK_SECS: i64 = 2;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Event {
+    Progress {
+        game_index: usize,
+        game_count: usize,
+        appid: String,
+        name: String,
+        phase: &'static str,
+        bytes_done: u64,
+        bytes_total: u64,
+        files_done: usize,
+        files_total: usize,
+        skipped_files: usize,
+        current_file: String,
+    },
+    GameDone {
+        appid: String,
+        name: String,
+        ok: bool,
+        message: String,
+    },
+    Finished {
+        cancelled: bool,
+        succeeded: usize,
+        failed: usize,
+    },
+}
+
+#[derive(Debug)]
+enum CopyError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<String> for CopyError {
+    fn from(s: String) -> Self {
+        CopyError::Failed(s)
+    }
+}
+
+fn io_err(path: &Path, e: std::io::Error) -> CopyError {
+    CopyError::Failed(format!("{}: {e}", path.display()))
+}
+
+struct FileItem {
+    rel: PathBuf,
+    size: u64,
+    mtime: FileTime,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+pub fn run(
+    source_steamapps: &Path,
+    target_library: &Path,
+    appids: &[String],
+    cancel: &AtomicBool,
+    report: &(dyn Fn(Event) + Sync),
+) {
+    let dst_apps = target_library.join("steamapps");
+    let (mut ok, mut failed) = (0, 0);
+    for (i, appid) in appids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let ctx = GameCtx { index: i, count: appids.len(), appid: appid.clone(), name: appid.clone() };
+        let (name, result) = copy_game(source_steamapps, &dst_apps, ctx, cancel, report);
+        let (good, message) = match result {
+            Ok(msg) => (true, msg),
+            Err(CopyError::Cancelled) => (false, "Cancelled".into()),
+            Err(CopyError::Failed(e)) => (false, e),
+        };
+        if good { ok += 1 } else { failed += 1 }
+        report(Event::GameDone { appid: appid.clone(), name, ok: good, message });
+    }
+    report(Event::Finished { cancelled: cancel.load(Ordering::Relaxed), succeeded: ok, failed });
+}
+
+struct GameCtx {
+    index: usize,
+    count: usize,
+    appid: String,
+    name: String,
+}
+
+fn copy_game(
+    src_apps: &Path,
+    dst_apps: &Path,
+    mut ctx: GameCtx,
+    cancel: &AtomicBool,
+    report: &(dyn Fn(Event) + Sync),
+) -> (String, Result<String, CopyError>) {
+    let manifest_name = format!("appmanifest_{}.acf", ctx.appid);
+    let manifest = match steam::read_manifest(&src_apps.join(&manifest_name)) {
+        Ok(m) => m,
+        Err(e) => return (ctx.name, Err(e.into())),
+    };
+    ctx.name = manifest.name.clone();
+    let name = ctx.name.clone();
+    (name, copy_game_inner(src_apps, dst_apps, &manifest, &manifest_name, &ctx, cancel, report))
+}
+
+fn copy_game_inner(
+    src_apps: &Path,
+    dst_apps: &Path,
+    manifest: &Manifest,
+    manifest_name: &str,
+    ctx: &GameCtx,
+    cancel: &AtomicBool,
+    report: &(dyn Fn(Event) + Sync),
+) -> Result<String, CopyError> {
+    let progress = |phase: &'static str, bytes_done, bytes_total, files_done, files_total, skipped_files, current_file: String| {
+        report(Event::Progress {
+            game_index: ctx.index,
+            game_count: ctx.count,
+            appid: ctx.appid.clone(),
+            name: ctx.name.clone(),
+            phase,
+            bytes_done,
+            bytes_total,
+            files_done,
+            files_total,
+            skipped_files,
+            current_file,
+        })
+    };
+
+    let src_dir = src_apps.join("common").join(&manifest.installdir);
+    let dst_dir = dst_apps.join("common").join(&manifest.installdir);
+    if !src_dir.is_dir() {
+        return Err(format!("Game folder not found on source: {}", src_dir.display()).into());
+    }
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(&src_dir), fs::canonicalize(&dst_dir))
+        && a == b {
+            return Err("Source and destination are the same folder".to_string().into());
+        }
+
+    // 1. Scan source and work out what actually needs copying.
+    progress("scanning", 0, 0, 0, 0, 0, String::new());
+    let mut dirs = Vec::new();
+    let mut links = Vec::new();
+    let mut to_copy = Vec::new();
+    let mut skipped = 0usize;
+    for entry in walkdir::WalkDir::new(&src_dir).follow_links(false) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CopyError::Cancelled);
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let rel = entry.path().strip_prefix(&src_dir).unwrap().to_path_buf();
+        let ft = entry.file_type();
+        if ft.is_dir() {
+            dirs.push(rel);
+        } else if ft.is_symlink() {
+            links.push(rel);
+        } else if ft.is_file() {
+            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            let item = FileItem {
+                size: meta.len(),
+                mtime: FileTime::from_last_modification_time(&meta),
+                #[cfg(unix)]
+                mode: std::os::unix::fs::PermissionsExt::mode(&meta.permissions()),
+                rel,
+            };
+            if is_up_to_date(&dst_dir.join(&item.rel), &item) {
+                skipped += 1;
+            } else {
+                to_copy.push(item);
+            }
+            if (to_copy.len() + skipped).is_multiple_of(500) {
+                progress("scanning", 0, 0, 0, to_copy.len() + skipped, skipped, String::new());
+            }
+        }
+    }
+    let bytes_total: u64 = to_copy.iter().map(|f| f.size).sum();
+    let files_total = to_copy.len() + skipped;
+
+    // 2. Make sure it fits (keep 1 GiB spare).
+    fs::create_dir_all(&dst_dir).map_err(|e| io_err(&dst_dir, e))?;
+    if let Ok(free) = fs4::available_space(&dst_dir) {
+        let needed = bytes_total + (1 << 30);
+        if free < needed {
+            return Err(format!(
+                "Not enough disk space: need {:.1} GB, {:.1} GB free",
+                needed as f64 / 1e9,
+                free as f64 / 1e9
+            )
+            .into());
+        }
+    }
+
+    // 3. Directories and symlinks.
+    for d in &dirs {
+        let p = dst_dir.join(d);
+        fs::create_dir_all(&p).map_err(|e| io_err(&p, e))?;
+    }
+    for l in &links {
+        copy_symlink(&src_dir.join(l), &dst_dir.join(l))?;
+    }
+
+    // 4. Files, several at a time. Big files first so the tail end isn't one huge file on one worker.
+    to_copy.sort_by_key(|f| std::cmp::Reverse(f.size));
+    let next = AtomicUsize::new(0);
+    let files_done = AtomicUsize::new(0);
+    let bytes_done = AtomicU64::new(0);
+    let current = Mutex::new(String::new());
+    let first_err: Mutex<Option<CopyError>> = Mutex::new(None);
+    let stop = AtomicBool::new(false);
+    let workers_left = AtomicUsize::new(WORKERS);
+
+    std::thread::scope(|s| {
+        for _ in 0..WORKERS {
+            s.spawn(|| {
+                let mut buf = vec![0u8; BUF_SIZE];
+                loop {
+                    if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = to_copy.get(i) else { break };
+                    *current.lock().unwrap() = item.rel.display().to_string();
+                    let r = copy_file(&src_dir.join(&item.rel), &dst_dir.join(&item.rel), item, &mut buf, &bytes_done, cancel, &stop);
+                    match r {
+                        Ok(()) => {
+                            files_done.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            stop.store(true, Ordering::Relaxed);
+                            first_err.lock().unwrap().get_or_insert(e);
+                            break;
+                        }
+                    }
+                }
+                workers_left.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+        // Progress reporter
+        loop {
+            let done = workers_left.load(Ordering::Relaxed) == 0;
+            progress(
+                "copying",
+                bytes_done.load(Ordering::Relaxed),
+                bytes_total,
+                files_done.load(Ordering::Relaxed) + skipped,
+                files_total,
+                skipped,
+                current.lock().unwrap().clone(),
+            );
+            if done {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CopyError::Cancelled);
+    }
+
+    // 5. Depot manifests (lets Steam validate/patch without a full verify), then the app manifest
+    //    last so Steam never sees a half-copied game as installed.
+    progress("finishing", bytes_total, bytes_total, files_total, files_total, skipped, manifest_name.to_string());
+    let dst_cache = dst_apps.join("depotcache");
+    for (depot, mid) in &manifest.depots {
+        let fname = format!("{depot}_{mid}.manifest");
+        let src = src_apps.join("depotcache").join(&fname);
+        if src.is_file() {
+            let _ = fs::create_dir_all(&dst_cache);
+            let _ = atomic_copy_small(&src, &dst_cache.join(&fname));
+        }
+    }
+    atomic_copy_small(&src_apps.join(manifest_name), &dst_apps.join(manifest_name))?;
+
+    let copied_gb = bytes_total as f64 / 1e9;
+    Ok(if skipped > 0 {
+        format!("Copied {copied_gb:.2} GB ({skipped} unchanged files skipped)")
+    } else {
+        format!("Copied {copied_gb:.2} GB")
+    })
+}
+
+fn is_up_to_date(dst: &Path, item: &FileItem) -> bool {
+    let Ok(meta) = fs::metadata(dst) else { return false };
+    let mtime = FileTime::from_last_modification_time(&meta);
+    meta.len() == item.size && (mtime.unix_seconds() - item.mtime.unix_seconds()).abs() <= MTIME_SLACK_SECS
+}
+
+fn partial_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(PARTIAL_SUFFIX);
+    dst.with_file_name(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_file(
+    src: &Path,
+    dst: &Path,
+    item: &FileItem,
+    buf: &mut [u8],
+    bytes_done: &AtomicU64,
+    cancel: &AtomicBool,
+    stop: &AtomicBool,
+) -> Result<(), CopyError> {
+    let tmp = partial_path(dst);
+    let result = (|| {
+        let mut input = File::open(src).map_err(|e| io_err(src, e))?;
+        let mut output = File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
+        #[cfg(unix)]
+        let mut first_bytes: Option<[u8; 4]> = None;
+        loop {
+            if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                return Err(CopyError::Cancelled);
+            }
+            let n = input.read(buf).map_err(|e| io_err(src, e))?;
+            if n == 0 {
+                break;
+            }
+            #[cfg(unix)]
+            if first_bytes.is_none() && n >= 4 {
+                first_bytes = Some([buf[0], buf[1], buf[2], buf[3]]);
+            }
+            output.write_all(&buf[..n]).map_err(|e| io_err(&tmp, e))?;
+            bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        drop(output);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // SMB mounts often lose the executable bit, so restore it for ELF binaries and scripts.
+            let looks_executable = matches!(first_bytes, Some([0x7f, b'E', b'L', b'F']) | Some([b'#', b'!', _, _]));
+            let mut mode = (item.mode & 0o777) | 0o600;
+            if looks_executable {
+                mode |= (mode & 0o444) >> 2; // +x wherever readable
+            }
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)).map_err(|e| io_err(&tmp, e))?;
+        }
+
+        filetime::set_file_mtime(&tmp, item.mtime).map_err(|e| io_err(&tmp, e))?;
+        fs::rename(&tmp, dst).map_err(|e| io_err(dst, e))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn copy_symlink(src: &Path, dst: &Path) -> Result<(), CopyError> {
+    #[cfg(unix)]
+    {
+        let target = fs::read_link(src).map_err(|e| io_err(src, e))?;
+        if fs::read_link(dst).ok().as_ref() == Some(&target) {
+            return Ok(());
+        }
+        let _ = fs::remove_file(dst);
+        std::os::unix::fs::symlink(&target, dst).map_err(|e| io_err(dst, e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Creating symlinks on Windows needs admin/dev mode, so copy what it points at instead.
+        let meta = fs::metadata(src).map_err(|e| io_err(src, e))?;
+        if meta.is_file() {
+            fs::copy(src, dst).map_err(|e| io_err(dst, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_copy_small(src: &Path, dst: &Path) -> Result<(), CopyError> {
+    let tmp = partial_path(dst);
+    fs::copy(src, &tmp).map_err(|e| io_err(&tmp, e))?;
+    fs::rename(&tmp, dst).map_err(|e| io_err(dst, e))?;
+    Ok(())
+}
+
+/// Shared handle so a running job can be cancelled from another command.
+#[derive(Default)]
+pub struct JobState(pub Mutex<Option<Arc<AtomicBool>>>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(p: &Path, content: &[u8]) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn copies_game_then_skips_unchanged() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let apps = src.path().join("steamapps");
+        write(
+            &apps.join("appmanifest_42.acf"),
+            br#""AppState" { "appid" "42" "name" "Test Game" "installdir" "Test Game" "StateFlags" "4"
+               "InstalledDepots" { "43" { "manifest" "999" } } }"#,
+        );
+        write(&apps.join("depotcache/43_999.manifest"), b"depot");
+        write(&apps.join("common/Test Game/game.bin"), &vec![7u8; 10 * 1024 * 1024]);
+        write(&apps.join("common/Test Game/data/a.txt"), b"hello");
+        write(&apps.join("common/Test Game/run.sh"), b"#!/bin/sh\necho hi\n");
+        fs::create_dir_all(dst.path().join("steamapps")).unwrap();
+
+        let events = Mutex::new(Vec::new());
+        let report = |e: Event| events.lock().unwrap().push(e);
+        let cancel = AtomicBool::new(false);
+        run(&apps, dst.path(), &["42".into()], &cancel, &report);
+
+        let out = dst.path().join("steamapps");
+        assert_eq!(fs::read(out.join("common/Test Game/data/a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::metadata(out.join("common/Test Game/game.bin")).unwrap().len(), 10 * 1024 * 1024);
+        assert!(out.join("appmanifest_42.acf").is_file());
+        assert!(out.join("depotcache/43_999.manifest").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(out.join("common/Test Game/run.sh")).unwrap().permissions().mode();
+            assert!(mode & 0o100 != 0, "script should be executable");
+        }
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, Event::GameDone { ok: true, .. })));
+
+        // Second run: everything is unchanged so nothing should be copied.
+        events.lock().unwrap().clear();
+        run(&apps, dst.path(), &["42".into()], &cancel, &report);
+        let ev = events.lock().unwrap();
+        let msg = ev.iter().find_map(|e| match e {
+            Event::GameDone { ok: true, message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        assert_eq!(msg.as_deref(), Some("Copied 0.00 GB (3 unchanged files skipped)"));
+    }
+}
