@@ -101,7 +101,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ needs.prepare.outputs.tag }}
-          releaseName: Steam Sharing ${{ needs.prepare.outputs.tag }}
+          releaseName: Ferry ${{ needs.prepare.outputs.tag }}
           releaseBody: |
             Built from ${{ github.sha }}.
 

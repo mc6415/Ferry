@@ -700,8 +700,8 @@
     <div class="brand" data-tauri-drag-region>
       <img class="logo" src="/logo.svg" alt="" width="40" height="40" draggable="false" data-tauri-drag-region />
       <div data-tauri-drag-region>
-        <h1 data-tauri-drag-region>Steam Sharing</h1>
-        <div class="tagline" data-tauri-drag-region>Copy games from another PC on your network</div>
+        <h1 data-tauri-drag-region>Ferry</h1>
+        <div class="tagline" data-tauri-drag-region>Copy Steam games from another PC on your network</div>
       </div>
     </div>
     <div class="spacer" data-tauri-drag-region></div>
