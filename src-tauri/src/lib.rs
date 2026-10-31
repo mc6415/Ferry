@@ -118,11 +118,41 @@ fn cancel_copy(state: State<'_, copy::JobState>) {
     }
 }
 
+/// GTK still paints its own window background and frame under the webview, which shows up
+/// as square corners around our rounded window. Make all of that transparent.
+#[cfg(target_os = "linux")]
+fn clear_gtk_background(win: &tauri::WebviewWindow) {
+    use gtk::prelude::*;
+    let Ok(gtk_win) = win.gtk_window() else { return };
+    let css = gtk::CssProvider::new();
+    if css
+        .load_from_data(b"window, window.background, decoration, .titlebar { background: transparent; box-shadow: none; border: none; }")
+        .is_err()
+    {
+        return;
+    }
+    if let Some(screen) = GtkWindowExt::screen(&gtk_win) {
+        gtk::StyleContext::add_provider_for_screen(&screen, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    gtk_win.set_app_paintable(true);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .setup(|_app| {
+            #[cfg(target_os = "linux")]
+            {
+                use tauri::Manager;
+                if let Some(win) = _app.get_webview_window("main") {
+                    clear_gtk_background(&win);
+                }
+            }
+            Ok(())
+        })
         .manage(copy::JobState::default())
         .manage(ImageSource::default())
         .register_asynchronous_uri_scheme_protocol("ssimg", |ctx, request, responder| {
