@@ -45,6 +45,7 @@ export const api = {
   detectPlatforms: (steamapps: string, installdirs: Record<string, string>) =>
     invoke<Record<string, Platform>>("detect_platforms", { steamapps, installdirs }),
   steamRunning: () => invoke<boolean>("steam_running"),
+  restartSteam: () => invoke<void>("restart_steam"),
   hostOs: () => invoke<string>("host_os"),
   startCopy: (steamapps: string, targetLibrary: string, appids: string[]) =>
     invoke<void>("start_copy", { steamapps, targetLibrary, appids }),
@@ -80,3 +81,10 @@ export const localImageUrl = (appid: string) => convertFileSrc(appid, "ssimg");
 /** Fallback when the share has no cached art. */
 export const cdnImageUrl = (appid: string) =>
   `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/header.jpg`;
+
+/** Wide library banner from the share's art cache. */
+export const localHeroUrl = (appid: string) => convertFileSrc(`hero-${appid}`, "ssimg");
+
+/** Fallback banner from the Steam CDN. */
+export const cdnHeroUrl = (appid: string) =>
+  `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/library_hero.jpg`;
