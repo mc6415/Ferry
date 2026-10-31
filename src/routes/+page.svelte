@@ -779,7 +779,8 @@
           <div class="jump-letter" aria-hidden="true" in:fade={{ duration: 80 }} out:fade={{ duration: 200 }}>{jumpLetter}</div>
         {/key}
       {/if}
-      {#if spotGame}
+      <!-- Hidden while the copy panel is open (it shows the game's art itself) so the list keeps its room. -->
+      {#if spotGame && !queue.length}
         {@const sst = status(spotGame)}
         <div class="banner" style={tintStyle(spotGame.appid)}>
           {#key spotGame.appid}
@@ -1269,7 +1270,9 @@
   .placeholder { display: grid; place-items: center; color: var(--dim); font-weight: 600; letter-spacing: 1px; font-size: 14px; background: var(--panel-3); }
 
   /* Grid view */
-  .rows.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; padding: 14px 6px 14px 14px; align-content: start; }
+  /* grid-auto-rows: max-content stops rows being squashed to fit the visible area (cards have
+     overflow: hidden, so their minimum height would otherwise be 0) */
+  .rows.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); grid-auto-rows: max-content; gap: 12px; padding: 14px 6px 14px 14px; align-content: start; }
   .rows.grid .game {
     grid-template-columns: 1fr; grid-template-areas: "thumb"; gap: 0; align-items: end;
     padding: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--panel);
