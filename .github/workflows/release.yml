@@ -3,14 +3,17 @@ name: Build & release
 # Builds Linux + Windows installers and publishes them as a release for the version in
 # src-tauri/tauri.conf.json (e.g. v0.3.0).
 #
-# - Push to main with a NEW version: builds and publishes that release.
-# - Push to main with an already-released version: skips the build (takes seconds).
+# - Only pushes to main that change src-tauri/tauri.conf.json (where the version lives) start
+#   a run at all, so ordinary merges don't add runs to the history.
+# - New version: builds and publishes that release.
+# - tauri.conf.json changed but the version is already released: skips the build.
 # - Manual run (Actions -> Build & release -> Run workflow): rebuilds the current version's
 #   release, e.g. after a failed build.
 
 on:
   push:
     branches: [main]
+    paths: [src-tauri/tauri.conf.json]
   workflow_dispatch:
 
 permissions:
