@@ -1,8 +1,12 @@
 name: Build & release
 
-# Every push to main builds Linux + Windows installers and publishes them to the release for the
-# version in src-tauri/tauri.conf.json (e.g. v0.1.0). Pushing again refreshes that release;
-# bumping the version creates a new one.
+# Builds Linux + Windows installers and publishes them as a release for the version in
+# src-tauri/tauri.conf.json (e.g. v0.3.0).
+#
+# - Push to main with a NEW version: builds and publishes that release.
+# - Push to main with an already-released version: skips the build (takes seconds).
+# - Manual run (Actions -> Build & release -> Run workflow): rebuilds the current version's
+#   release, e.g. after a failed build.
 
 on:
   push:
@@ -12,46 +16,59 @@ on:
 permissions:
   contents: write
 
-# A newer push supersedes a build that's still running.
+# Runs queue rather than cancel each other, so a quick skipped run can't cancel a real
+# release build that's still in progress.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      build: ${{ steps.check.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: version
         run: echo "tag=v$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
 
-      # If this version was already released, point its tag at this commit and clear the old
-      # files so the build jobs can upload fresh ones.
-      - name: Refresh existing release
+      # Decide whether to build. A manual run rebuilds an existing release: point its tag at
+      # this commit and clear the old files so the build jobs can upload fresh ones.
+      - name: Check for an existing release
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "New version $TAG: building." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Manual run: rebuilding the existing $TAG release." | tee -a "$GITHUB_STEP_SUMMARY"
             git tag -f "$TAG"
             git push -f origin "refs/tags/$TAG"
             gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r asset; do
               gh release delete-asset "$TAG" "$asset" --yes
             done
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is already released, so nothing to build. Bump the version in src-tauri/tauri.conf.json to publish a new release." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
         platform: [ubuntu-22.04, windows-latest]
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -59,7 +76,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: npm
