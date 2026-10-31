@@ -31,20 +31,28 @@ async fn list_games(source: String, images: State<'_, ImageSource>) -> Result<Ga
     Ok(GameList { steamapps, games })
 }
 
-/// Serves `ssimg://localhost/<appid>` from Steam's local art cache on the share.
+/// Serves `ssimg://localhost/<appid>` (header art) and `ssimg://localhost/hero-<appid>`
+/// (library banner) from Steam's local art cache on the share.
 fn image_response(app: &AppHandle, request: &tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>> {
     use tauri::Manager;
     let not_found = || tauri::http::Response::builder().status(404).body(Vec::new()).unwrap();
-    let appid = request.uri().path().trim_start_matches('/');
+    let path = request.uri().path().trim_start_matches('/');
+    let (hero, appid) = match path.strip_prefix("hero-") {
+        Some(id) => (true, id),
+        None => (false, path),
+    };
     if appid.is_empty() || !appid.bytes().all(|b| b.is_ascii_digit()) {
         return not_found();
     }
     let Some(steamapps) = app.state::<ImageSource>().0.lock().unwrap().clone() else {
         return not_found();
     };
-    match steam::find_header_image(&steamapps, appid).and_then(|p| std::fs::read(p).ok()) {
+    let found = if hero { steam::find_hero_image(&steamapps, appid) } else { steam::find_header_image(&steamapps, appid) };
+    match found.and_then(|p| std::fs::read(p).ok()) {
         Some(bytes) => tauri::http::Response::builder()
             .header("Content-Type", "image/jpeg")
+            // Lets the page read pixels to pick each game's accent colour.
+            .header("Access-Control-Allow-Origin", "*")
             .header("Cache-Control", "max-age=86400")
             .body(bytes)
             .unwrap(),
@@ -90,6 +98,32 @@ fn host_os() -> &'static str {
 #[tauri::command]
 fn steam_running() -> bool {
     steam::is_steam_running()
+}
+
+/// Quits Steam (if running) and starts it again so it picks up newly copied games.
+/// Goes through `steam://` links, so it works with any install (native, Flatpak, Windows).
+#[tauri::command]
+async fn restart_steam(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if steam::is_steam_running() {
+        app.opener().open_url("steam://exit", None::<&str>).map_err(|e| e.to_string())?;
+        let closed = blocking(|| {
+            for _ in 0..60 {
+                if !steam::is_steam_running() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            false
+        })
+        .await?;
+        if !closed {
+            return Err("Steam didn't close within 30 seconds".into());
+        }
+        // Give Steam a moment to release its files before relaunching.
+        blocking(|| std::thread::sleep(std::time::Duration::from_secs(2))).await?;
+    }
+    app.opener().open_url("steam://open/games", None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -165,6 +199,7 @@ pub fn run() {
             local_libraries,
             detect_platforms,
             steam_running,
+            restart_steam,
             host_os,
             start_copy,
             cancel_copy

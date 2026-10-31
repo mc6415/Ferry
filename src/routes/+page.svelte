@@ -1,17 +1,21 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
+  import { Tween } from "svelte/motion";
+  import { cubicOut } from "svelte/easing";
   import { fade, fly } from "svelte/transition";
   import { flip } from "svelte/animate";
   import "@fontsource/barlow-condensed/500.css";
   import "@fontsource/barlow-condensed/600.css";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { getCurrentWindow, ProgressBarStatus } from "@tauri-apps/api/window";
   import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
   import {
     api,
     cdnImageUrl,
     localImageUrl,
+    cdnHeroUrl,
+    localHeroUrl,
     formatBytes,
     formatDuration,
     type CopyEvent,
@@ -45,7 +49,35 @@
 
   let search = $state("");
   let hideTools = $state(true);
-  let filter = $state<"all" | "missing" | "outdated">("all");
+  type Filter = "all" | "missing" | "outdated" | "new" | "selected";
+  let filter = $state<Filter>("all");
+  // Where to go back to when leaving the "review selected" view.
+  let filterBeforeReview: Filter = "all";
+  function toggleReview() {
+    if (filter === "selected") filter = filterBeforeReview;
+    else if (selected.size) {
+      filterBeforeReview = filter;
+      filter = "selected";
+    }
+  }
+  let searchEl = $state<HTMLInputElement>();
+
+  // ---- "New on the share": games not seen on previous visits (remembered per share) ----
+  const newIds = new SvelteSet<string>();
+  function markNew(steamappsPath: string, list: Game[]) {
+    const key = `seen:${steamappsPath}`;
+    const ids = list.map((g) => g.appid);
+    const raw = store.get(key);
+    if (raw) {
+      let seen: string[] = [];
+      try { seen = JSON.parse(raw); } catch {}
+      const seenSet = new Set(seen);
+      for (const id of ids) if (!seenSet.has(id)) newIds.add(id);
+    }
+    // First visit to a share: nothing is "new", just remember what's there.
+    for (const id of [...newIds]) if (!ids.includes(id)) newIds.delete(id);
+    store.set(key, JSON.stringify(ids));
+  }
   let sort = $state<"name" | "size">("name");
   const selected = new SvelteSet<string>();
   // Image fallback chain: share cache → Steam CDN → placeholder.
@@ -53,6 +85,269 @@
   const imgFailed = new SvelteSet<string>();
   const imgLoaded = new SvelteSet<string>();
   const imgSrc = (appid: string) => (imgCdn.has(appid) ? cdnImageUrl(appid) : localImageUrl(appid));
+
+  // ---- Spotlight banner: the hovered (or last selected) game's library art ----
+  let spotlight = $state<string | null>(null);
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+  function hoverGame(appid: string) {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => (spotlight = appid), 120);
+  }
+  // Banner fallback chain: share hero → CDN hero → header art → nothing.
+  const heroStage = new SvelteMap<string, number>();
+  function heroSrc(appid: string): string | null {
+    const stage = heroStage.get(appid) ?? 0;
+    if (stage === 0) return localHeroUrl(appid);
+    if (stage === 1) return cdnHeroUrl(appid);
+    if (stage === 2 && !imgFailed.has(appid)) return imgSrc(appid);
+    return null;
+  }
+  const heroFailed = (appid: string) => heroStage.set(appid, (heroStage.get(appid) ?? 0) + 1);
+
+  // ---- Per-game colour picked from its cover art ----
+  const tints = new SvelteMap<string, string>();
+  const tintRequested = new Set<string>();
+  function sampleTint(appid: string) {
+    if (tintRequested.has(appid)) return;
+    tintRequested.add(appid);
+    // A separate CORS-enabled load, so the visible image is never affected if this fails.
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const c = dominantColour(img);
+      if (c) tints.set(appid, c);
+    };
+    img.src = imgSrc(appid);
+  }
+  /** The most prominent saturated hue in the image, normalised so it reads well on dark grey. */
+  function dominantColour(img: HTMLImageElement): string | null {
+    try {
+      const size = 24;
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, size, size);
+      const px = ctx.getImageData(0, 0, size, size).data;
+      const weight = new Array(36).fill(0);
+      const hueSum = new Array(36).fill(0);
+      for (let i = 0; i < px.length; i += 4) {
+        const r = px[i] / 255, g = px[i + 1] / 255, b = px[i + 2] / 255;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        const l = (max + min) / 2, d = max - min;
+        if (d < 0.08 || l < 0.1 || l > 0.92) continue;
+        const sat = d / (1 - Math.abs(2 * l - 1));
+        let h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+        h = (h * 60 + 360) % 360;
+        const w = sat * (1 - Math.abs(l - 0.5));
+        const bin = Math.floor(h / 10);
+        weight[bin] += w;
+        hueSum[bin] += h * w;
+      }
+      let best = 0;
+      for (let i = 1; i < 36; i++) if (weight[i] > weight[best]) best = i;
+      if (weight[best] < 4) return null; // basically greyscale art
+      return `hsl(${Math.round(hueSum[best] / weight[best])} 72% 64%)`;
+    } catch {
+      return null;
+    }
+  }
+  const tintStyle = (appid: string | undefined | null) => (appid && tints.has(appid) ? `--g:${tints.get(appid)}` : undefined);
+
+  // ---- Footer numbers glide to new values ----
+  const selCountT = new Tween(0, { duration: 250, easing: cubicOut });
+  const selBytesT = new Tween(0, { duration: 350, easing: cubicOut });
+
+  // ---- Stats tiles and copy readouts tick to new values ----
+  const tick = { duration: 600, easing: cubicOut };
+  const statCountT = new Tween(0, tick);
+  const statBytesT = new Tween(0, tick);
+  const statMissingT = new Tween(0, tick);
+  const statOutdatedT = new Tween(0, tick);
+  const speedT = new Tween(0, { duration: 500, easing: cubicOut });
+  const etaT = new Tween(0, { duration: 500, easing: cubicOut });
+  let etaKnown = false;
+
+  // ---- Restart Steam after copying ----
+  let restarting = $state(false);
+  let restartError = $state("");
+  async function restartSteam() {
+    restarting = true;
+    restartError = "";
+    try {
+      await api.restartSteam();
+    } catch (e) {
+      restartError = String(e);
+    } finally {
+      restarting = false;
+    }
+  }
+
+  // ---- Keyboard cursor: arrows move through games, Space ticks the current one ----
+  let cursor = $state<string | null>(null);
+  let kbdNav = $state(false); // highlight only shows after using the keyboard
+  let rowsEl = $state<HTMLDivElement>();
+
+  function gridColumns(): number {
+    if (view !== "grid" || !rowsEl) return 1;
+    return getComputedStyle(rowsEl).gridTemplateColumns.split(" ").filter(Boolean).length || 1;
+  }
+
+  /** First letter of a name for A–Z jumping; digits and symbols share "#". */
+  function letterOf(name: string): string {
+    const c = name.replace(/^[^\p{L}\p{N}]+/u, "").charAt(0).toUpperCase();
+    return /\p{L}/u.test(c) ? c : "#";
+  }
+
+  /** Index of the first game in the next (dir 1) or previous (dir -1) letter group. */
+  function letterTarget(cur: number, dir: 1 | -1): number {
+    const n = visible.length;
+    if (cur < 0) return 0;
+    const here = letterOf(visible[cur].name);
+    if (dir === 1) {
+      for (let i = cur + 1; i < n; i++) if (letterOf(visible[i].name) !== here) return i;
+      return cur;
+    }
+    let start = cur;
+    while (start > 0 && letterOf(visible[start - 1].name) === here) start--;
+    if (start === 0) return 0;
+    const prev = letterOf(visible[start - 1].name);
+    let j = start - 1;
+    while (j > 0 && letterOf(visible[j - 1].name) === prev) j--;
+    return j;
+  }
+
+  // Big letter that pops up briefly after a letter jump.
+  let jumpLetter = $state("");
+  let jumpLetterTimer: ReturnType<typeof setTimeout> | undefined;
+  function flashLetter(letter: string) {
+    jumpLetter = letter;
+    clearTimeout(jumpLetterTimer);
+    jumpLetterTimer = setTimeout(() => (jumpLetter = ""), 650);
+  }
+
+  function moveCursor(key: string, shift = false): boolean {
+    if (!visible.length) return false;
+    const cols = gridColumns();
+    const cur = visible.findIndex((g) => g.appid === cursor);
+    // Left/Right jump between letters: always in list view, with Shift in grid view.
+    const sideways = key === "ArrowLeft" || key === "ArrowRight";
+    if (sideways && (view === "list" || shift)) {
+      const dir = key === "ArrowRight" ? 1 : -1;
+      if (sort === "name") {
+        const target = letterTarget(cur, dir);
+        setCursor(target);
+        flashLetter(letterOf(visible[target].name));
+      } else {
+        const page = Math.max(1, Math.floor((rowsEl?.clientHeight ?? 400) / 77)) * cols;
+        setCursor(cur < 0 ? 0 : cur + dir * page);
+      }
+      return true;
+    }
+    const page = Math.max(1, Math.floor((rowsEl?.clientHeight ?? 400) / 77)) * cols;
+    // Up from the top row goes back to the search box.
+    if (key === "ArrowUp" && cur >= 0 && cur < cols && searchEl) {
+      kbdNav = false;
+      searchEl.focus();
+      return true;
+    }
+    let next: number;
+    if (cur < 0) next = 0;
+    else if (key === "ArrowDown") next = cur + cols;
+    else if (key === "ArrowUp") next = cur - cols;
+    else if (key === "ArrowRight") next = cur + 1;
+    else if (key === "ArrowLeft") next = cur - 1;
+    else if (key === "PageDown") next = cur + page;
+    else if (key === "PageUp") next = cur - page;
+    else if (key === "Home") next = 0;
+    else if (key === "End") next = visible.length - 1;
+    else return false;
+    setCursor(next);
+    return true;
+  }
+
+  function setCursor(index: number) {
+    const i = Math.max(0, Math.min(visible.length - 1, index));
+    const id = visible[i].appid;
+    cursor = id;
+    spotlight = id;
+    kbdNav = true;
+    rowsEl?.querySelector(`[data-appid="${id}"]`)?.scrollIntoView({ block: "nearest" });
+  }
+
+  // If the highlighted game drops out of the list (e.g. unticked while reviewing),
+  // move the highlight to whichever game now sits in its place.
+  let lastCursorIndex = -1;
+  $effect(() => {
+    if (!cursor) return;
+    const i = visible.findIndex((g) => g.appid === cursor);
+    if (i >= 0) lastCursorIndex = i;
+    else if (visible.length && lastCursorIndex >= 0) {
+      const next = visible[Math.min(lastCursorIndex, visible.length - 1)].appid;
+      untrack(() => {
+        cursor = next;
+        spotlight = next;
+      });
+    }
+  });
+
+  function toggleGame(appid: string) {
+    if (selected.has(appid)) selected.delete(appid);
+    else {
+      selected.add(appid);
+      spotlight = appid;
+    }
+  }
+
+  // ---- Keyboard shortcuts ----
+  function onKey(e: KeyboardEvent) {
+    const t = e.target as HTMLElement;
+    const typing =
+      (t instanceof HTMLInputElement && t.type !== "checkbox") || t instanceof HTMLSelectElement || t instanceof HTMLTextAreaElement;
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+    // A ticked checkbox keeps focus after a click; drop it so Space/arrows drive the list instead.
+    if (t instanceof HTMLInputElement && t.type === "checkbox" && (e.key === " " || e.key.startsWith("Arrow"))) t.blur();
+
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      if (canCopy) startCopy();
+    } else if (t === searchEl && plain && (e.key === "ArrowDown" || e.key === "Enter")) {
+      // From the search box straight into the results.
+      if (visible.length) {
+        e.preventDefault();
+        searchEl.blur();
+        setCursor(0);
+      }
+    } else if (!typing && plain && games.length && moveCursor(e.key, e.shiftKey)) {
+      e.preventDefault();
+    } else if (e.key === " " && !typing && plain && !(t instanceof HTMLButtonElement) && cursor && visible.some((g) => g.appid === cursor)) {
+      e.preventDefault();
+      kbdNav = true;
+      toggleGame(cursor);
+    } else if (e.key === "/" && !typing && games.length) {
+      e.preventDefault();
+      searchEl?.focus();
+      searchEl?.select();
+    } else if (e.key.toLowerCase() === "s" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey && games.length) {
+      e.preventDefault();
+      toggleReview();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && !typing && games.length) {
+      e.preventDefault();
+      for (const g of visible) selected.add(g.appid);
+    } else if (e.key === "Escape") {
+      if (t === searchEl && search) search = "";
+      else if (typing) t.blur();
+      else if (filter === "selected") toggleReview();
+      else selected.clear();
+    }
+  }
+
+  // ---- Rows cascade in when a share is (re)loaded ----
+  let cascade = $state(false);
+
+  // ---- Live copy view: recent transfer speeds for the sparkline ----
+  let speedHist = $state<number[]>([]);
+  let lastHistAt = 0;
 
   let view = $state<"list" | "grid">(store.get("view") === "grid" ? "grid" : "list");
   function setView(v: "list" | "grid") {
@@ -86,11 +381,16 @@
   }
 
   const visible = $derived.by(() => {
+    // Reviewing the selection: show every selected game, ignoring search and hide-tools.
+    if (filter === "selected") {
+      const list = games.filter((g) => selected.has(g.appid));
+      return sort === "size" ? list.sort((a, b) => b.sizeOnDisk - a.sizeOnDisk) : list;
+    }
     const q = search.trim().toLowerCase();
     let list = games.filter(
       (g) =>
         (!hideTools || !g.isTool) &&
-        (filter === "all" || status(g) === filter) &&
+        (filter === "all" || (filter === "new" ? newIds.has(g.appid) : status(g) === filter)) &&
         (!q || g.name.toLowerCase().includes(q) || g.appid === q),
     );
     if (sort === "size") list = [...list].sort((a, b) => b.sizeOnDisk - a.sizeOnDisk);
@@ -100,6 +400,56 @@
   const selectedGames = $derived(games.filter((g) => selected.has(g.appid)));
   const selectedBytes = $derived(selectedGames.reduce((n, g) => n + g.sizeOnDisk, 0));
   const notEnoughSpace = $derived(targetLib?.free_bytes != null && selectedBytes > targetLib.free_bytes);
+  const canCopy = $derived(!copying && selectedGames.length > 0 && !!target && !notEnoughSpace);
+  const spotGame = $derived(games.find((g) => g.appid === spotlight) ?? visible[0] ?? null);
+  const spotHero = $derived(spotGame ? heroSrc(spotGame.appid) : null);
+
+  $effect(() => {
+    if (filter === "selected" && selected.size === 0) filter = filterBeforeReview;
+  });
+
+  $effect(() => {
+    selCountT.target = selectedGames.length;
+    selBytesT.target = selectedBytes;
+  });
+
+  $effect(() => {
+    statCountT.target = stats.count;
+    statBytesT.target = stats.bytes;
+    statMissingT.target = stats.missing;
+    statOutdatedT.target = stats.outdated;
+  });
+
+  $effect(() => {
+    speedT.target = speed;
+    const eta = overall.eta;
+    if (isFinite(eta)) {
+      // Jump straight to the first estimate rather than counting up from zero.
+      if (!etaKnown) etaT.set(eta, { duration: 0 });
+      else etaT.target = eta;
+      etaKnown = true;
+    } else etaKnown = false;
+  });
+
+  // Copy progress on the taskbar entry (only sent when the whole percent changes).
+  let lastTaskbarPct = -1;
+  $effect(() => {
+    const pct = copying ? Math.round(overall.pct) : -1;
+    if (pct === lastTaskbarPct) return;
+    lastTaskbarPct = pct;
+    appWindow
+      .setProgressBar(pct < 0 ? { status: ProgressBarStatus.None } : { status: ProgressBarStatus.Normal, progress: pct })
+      .catch(() => {});
+  });
+
+  const sparkline = $derived.by(() => {
+    if (speedHist.length < 2) return "";
+    const max = Math.max(...speedHist) || 1;
+    const w = 120, h = 26, step = w / 59;
+    const x0 = w - (speedHist.length - 1) * step;
+    return speedHist.map((v, i) => `${(x0 + i * step).toFixed(1)},${(h - 2 - (v / max) * (h - 4)).toFixed(1)}`).join(" ");
+  });
+
   const allVisibleSelected = $derived(visible.length > 0 && visible.every((g) => selected.has(g.appid)));
 
   // Headline numbers for the share (tools excluded).
@@ -119,13 +469,14 @@
   // Filter-chip counts, respecting search + hide-tools but not the status filter itself.
   const counts = $derived.by(() => {
     const q = search.trim().toLowerCase();
-    const c = { all: 0, missing: 0, outdated: 0 };
+    const c = { all: 0, missing: 0, outdated: 0, new: 0 };
     for (const g of games) {
       if (hideTools && g.isTool) continue;
       if (q && !g.name.toLowerCase().includes(q) && g.appid !== q) continue;
       c.all++;
       const s = status(g);
       if (s !== "installed") c[s]++;
+      if (newIds.has(g.appid)) c.new++;
     }
     return c;
   });
@@ -191,7 +542,12 @@
     try {
       const res = await api.listGames(source);
       steamapps = res.steamapps;
+      if (!games.length) {
+        cascade = true;
+        setTimeout(() => (cascade = false), 900);
+      }
       games = res.games;
+      markNew(res.steamapps, res.games);
       store.set("source", source);
       for (const id of [...selected]) if (!games.some((g) => g.appid === id)) selected.delete(id);
       detectPlatforms();
@@ -238,6 +594,8 @@
     finishedSummary = "";
     finishedOk = false;
     speed = 0;
+    speedHist = [];
+    lastHistAt = 0;
     lastSample = null;
     copying = true;
     try {
@@ -260,6 +618,10 @@
           speed = speed ? speed * 0.85 + inst * 0.15 : inst;
         }
         lastSample = { t: now, bytes: e.bytesDone, appid: e.appid };
+        if (speed > 0 && now - lastHistAt > 500) {
+          lastHistAt = now;
+          speedHist = [...speedHist.slice(-59), speed];
+        }
       }
     } else if (e.kind === "gameDone") {
       const item = queue.find((q) => q.appid === e.appid);
@@ -318,9 +680,13 @@
   });
 </script>
 
+{#snippet key(label: string)}<kbd class="key">{label}</kbd>{/snippet}
+
 {#snippet icon(name: keyof typeof icons, size = 16)}
   <svg class="ic" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true"><path d={icons[name]} /></svg>
 {/snippet}
+
+<svelte:window onkeydown={onKey} />
 
 <div class="frame" class:max={maximized}>
 <div class="ambient" aria-hidden="true">
@@ -367,14 +733,14 @@
     {#if steamapps && !error}
       <div class="tiles" title={steamapps}>
         <button class="tile" class:on={filter === "all"} onclick={() => (filter = "all")}>
-          <span class="num">{stats.count}</span><span class="lbl">games on the share</span>
+          <span class="num">{Math.round(statCountT.current)}</span><span class="lbl">games on the share</span>
         </button>
-        <div class="tile static"><span class="num">{formatBytes(stats.bytes)}</span><span class="lbl">total size</span></div>
+        <div class="tile static"><span class="num">{formatBytes(statBytesT.current)}</span><span class="lbl">total size</span></div>
         <button class="tile" class:on={filter === "missing"} class:hot={stats.missing > 0} onclick={() => (filter = "missing")}>
-          <span class="num">{stats.missing}</span><span class="lbl">not installed here</span>
+          <span class="num">{Math.round(statMissingT.current)}</span><span class="lbl">not installed here</span>
         </button>
         <button class="tile" class:on={filter === "outdated"} class:hot={stats.outdated > 0} onclick={() => (filter = "outdated")}>
-          <span class="num">{stats.outdated}</span><span class="lbl">{stats.outdated === 1 ? "update" : "updates"} available</span>
+          <span class="num">{Math.round(statOutdatedT.current)}</span><span class="lbl">{stats.outdated === 1 ? "update" : "updates"} available</span>
         </button>
       </div>
     {/if}
@@ -384,12 +750,17 @@
     <section class="toolbar">
       <div class="field search">
         {@render icon("search")}
-        <input type="search" bind:value={search} placeholder="Search games…" />
+        <input type="search" bind:this={searchEl} bind:value={search} placeholder="Search games…" />
+        <kbd class="kbd idle" class:hidden={!!search} title="Press / to search">/</kbd>
+        <kbd class="kbd go" title="Down arrow or Enter jumps to the results">↓ results</kbd>
       </div>
       <div class="seg">
         <button class:active={filter === "all"} onclick={() => (filter = "all")}>All <span class="count">{counts.all}</span></button>
         <button class:active={filter === "missing"} onclick={() => (filter = "missing")}>Not installed <span class="count">{counts.missing}</span></button>
         <button class:active={filter === "outdated"} onclick={() => (filter = "outdated")}>Outdated <span class="count">{counts.outdated}</span></button>
+        {#if counts.new || filter === "new"}
+          <button class="new-filter" class:active={filter === "new"} onclick={() => (filter = "new")}>New <span class="count">{counts.new}</span></button>
+        {/if}
       </div>
       <select bind:value={sort} aria-label="Sort">
         <option value="name">Sort: Name</option>
@@ -402,27 +773,80 @@
       </div>
     </section>
 
-    <div class="list">
-      <div class="list-head">
-        <label class="check"><input type="checkbox" checked={allVisibleSelected} onchange={toggleAll} /> Select all <span class="dim">· {visible.length} shown</span></label>
-        {#if view === "list"}<span>Size</span>{/if}
+    <div class="list" onmouseleave={() => clearTimeout(hoverTimer)} role="presentation">
+      {#if jumpLetter}
+        {#key jumpLetter}
+          <div class="jump-letter" aria-hidden="true" in:fade={{ duration: 80 }} out:fade={{ duration: 200 }}>{jumpLetter}</div>
+        {/key}
+      {/if}
+      {#if spotGame}
+        {@const sst = status(spotGame)}
+        <div class="banner" style={tintStyle(spotGame.appid)}>
+          {#key spotGame.appid}
+            {#if spotHero}
+              <img src={spotHero} alt="" transition:fade={{ duration: 350 }} onerror={() => spotGame && heroFailed(spotGame.appid)} />
+            {/if}
+          {/key}
+          <div class="banner-info">
+            {#key spotGame.appid}
+              <div class="banner-text" in:fly={{ x: -10, duration: 250 }}>
+                <div class="banner-name">{spotGame.name}</div>
+                <div class="banner-meta">
+                  <span class="banner-status {sst}">{sst === "installed" ? "Installed" : sst === "outdated" ? "Update available" : "Not installed"}</span>
+                  <span>{formatBytes(spotGame.sizeOnDisk)}</span>
+                  {#if newIds.has(spotGame.appid)}<span class="banner-new">New on the share</span>{/if}
+                  {#if selected.has(spotGame.appid)}<span>Selected</span>{/if}
+                </div>
+              </div>
+            {/key}
+          </div>
+        </div>
+      {/if}
+      <div class="list-head" class:review={filter === "selected"}>
+        {#if filter === "selected"}
+          <span class="review-title">
+            Reviewing <strong>{selectedGames.length}</strong> selected · {formatBytes(selectedBytes)}
+            <span class="dim">· untick anything you don't want</span>
+          </span>
+          <button class="ghost small" onclick={toggleReview} title="S or Esc">Back to all games {@render key("Esc")}</button>
+        {:else}
+          <label class="check" title="Ctrl+A selects all shown · S reviews selected · Esc clears"><input type="checkbox" checked={allVisibleSelected} onchange={toggleAll} /> Select all <span class="dim">· {visible.length} shown</span></label>
+          <span class="head-right">
+            <span class="keys" aria-hidden="true">
+              {@render key(view === "grid" ? "←↑↓→" : "↑↓")} move
+              {#if sort === "name"}{@render key(view === "grid" ? "⇧←→" : "←→")} letter{/if}
+              {@render key("Space")} select {@render key("S")} review
+            </span>
+            {#if view === "list"}<span>Size</span>{/if}
+          </span>
+        {/if}
       </div>
-      <div class="rows" class:grid={view === "grid"} role="list">
-      {#each visible as g (g.appid)}
+      <div class="rows" class:grid={view === "grid"} role="list" bind:this={rowsEl} onmousemove={() => (kbdNav = false)}>
+      {#each visible as g, i (g.appid)}
         {@const st = status(g)}
         {@const pb = platformBadge(platforms[g.appid])}
         <label
           class="game"
           class:sel={selected.has(g.appid)}
           class:have={st === "installed"}
+          class:cursor={kbdNav && cursor === g.appid}
+          data-appid={g.appid}
+          style={tintStyle(g.appid)}
           role="listitem"
+          onmouseenter={() => hoverGame(g.appid)}
           animate:flip={{ duration: 220 }}
-          in:fly={{ y: 8, duration: 200 }}
+          in:fly|global={{ y: 10, duration: 220, delay: cascade ? Math.min(i, 20) * 22 : 0 }}
         >
           <input
             type="checkbox"
             checked={selected.has(g.appid)}
-            onchange={(e) => (e.currentTarget.checked ? selected.add(g.appid) : selected.delete(g.appid))}
+            onchange={(e) => {
+              cursor = g.appid;
+              if (e.currentTarget.checked) {
+                selected.add(g.appid);
+                spotlight = g.appid;
+              } else selected.delete(g.appid);
+            }}
           />
           {#if imgFailed.has(g.appid)}
             <div class="thumb placeholder loaded" aria-hidden="true">{g.name.replace(/[^\p{L}\p{N}]/gu, "").slice(0, 2).toUpperCase()}</div>
@@ -433,7 +857,10 @@
                 alt=""
                 loading="lazy"
                 {@attach trackLoaded(g.appid)}
-                onload={() => imgLoaded.add(g.appid)}
+                onload={() => {
+                  imgLoaded.add(g.appid);
+                  sampleTint(g.appid);
+                }}
                 onerror={() => (imgCdn.has(g.appid) ? imgFailed.add(g.appid) : imgCdn.add(g.appid))}
               />
             </div>
@@ -441,6 +868,7 @@
           <div class="meta">
             <div class="name">{g.name}</div>
             <div class="badges">
+              {#if newIds.has(g.appid)}<span class="badge new">New</span>{/if}
               {#if st === "installed"}<span class="badge ok">Installed</span>{/if}
               {#if st === "outdated"}<span class="badge info" title="Local build {g.local?.buildid}, share has {g.buildid}">Update available</span>{/if}
               {#if !g.complete}<span class="badge warn" title="Not fully installed/updated on the share">Incomplete on share</span>{/if}
@@ -474,7 +902,13 @@
   {/if}
 
   {#if queue.length}
-    <section class="job" class:running={copying}>
+    <section class="job" class:running={copying} style={tintStyle(progress?.appid)}>
+      {#if copying && progress}
+        {#key progress.appid}
+          {@const art = heroSrc(progress.appid)}
+          {#if art}<img class="job-art" src={art} alt="" transition:fade={{ duration: 500 }} />{/if}
+        {/key}
+      {/if}
       <div class="job-head">
         {#if finishedOk}
           <span class="done-mark" aria-hidden="true">
@@ -483,11 +917,20 @@
         {/if}
         <strong>{copying ? (progress ? `Copying ${progress.gameIndex + 1} of ${progress.gameCount}` : "Starting…") : finishedSummary}</strong>
         {#if copying}
-          <span class="stat">{formatBytes(speed)}/s</span>
-          <span class="stat">{formatDuration(overall.eta)} left</span>
+          {#if sparkline}
+            <svg class="spark" viewBox="0 0 120 26" width="120" height="26" aria-hidden="true"><polyline points={sparkline} /></svg>
+          {/if}
+          <span class="stat">{formatBytes(speedT.current)}/s</span>
+          <span class="stat">{isFinite(overall.eta) ? formatDuration(etaT.current) : "–"} left</span>
           <button class="danger" onclick={() => api.cancelCopy()}>{@render icon("x", 14)}Cancel</button>
         {:else}
-          <button class="ghost" onclick={() => (queue = [])}>Dismiss</button>
+          {#if queue.some((q) => q.status === "done")}
+            <button class="primary" disabled={restarting} onclick={restartSteam} title="Steam only picks up new games when it starts">
+              {#if restarting}<span class="spinner"></span>{steamRunning ? "Restarting Steam…" : "Opening Steam…"}
+              {:else}{@render icon("refresh", 14)}{steamRunning ? "Restart Steam" : "Open Steam"}{/if}
+            </button>
+          {/if}
+          <button class="ghost" onclick={() => ((queue = []), (restartError = ""))}>Dismiss</button>
         {/if}
       </div>
       {#if copying}
@@ -505,6 +948,7 @@
           <div class="file" title={progress.currentFile}>{progress.currentFile}</div>
         {/if}
       {/if}
+      {#if restartError}<p class="error">{@render icon("alert", 14)}{restartError}</p>{/if}
       <ul class="queue">
         {#each queue as q (q.appid)}
           <li class={q.status}>
@@ -514,6 +958,7 @@
               {:else if q.status === "failed"}{@render icon("x", 12)}
               {/if}
             </span>
+            {#if !imgFailed.has(q.appid)}<img class="qthumb" src={imgSrc(q.appid)} alt="" />{:else}<span></span>{/if}
             <span class="qn">{q.name}</span>
             <span class="hint">{q.message || formatBytes(q.size)}</span>
           </li>
@@ -541,13 +986,20 @@
         {/if}
       </div>
     </div>
-    <div class="summary" class:bad={notEnoughSpace}>
-      <div class="sum-main">{selectedGames.length} selected</div>
-      <div class="sum-sub">{notEnoughSpace ? "Not enough space" : selectedGames.length ? formatBytes(selectedBytes) : "Pick games above"}</div>
-    </div>
+    <button
+      class="summary"
+      class:bad={notEnoughSpace}
+      class:on={filter === "selected"}
+      disabled={!selectedGames.length || !games.length}
+      onclick={toggleReview}
+      title={filter === "selected" ? "Back to all games (S)" : "Review the selected games (S)"}
+    >
+      <span class="sum-main">{Math.round(selCountT.current)} selected {@render key("S")}</span>
+      <span class="sum-sub">{notEnoughSpace ? "Not enough space" : selectedGames.length ? formatBytes(selBytesT.current) : "Pick games above"}</span>
+    </button>
     <button class="primary big" onclick={startCopy} disabled={copying || !selectedGames.length || !target || notEnoughSpace}>
       {#if copying}<span class="spinner"></span>Copying…
-      {:else}{@render icon("download")}Copy {selectedGames.length || ""} game{selectedGames.length === 1 ? "" : "s"}{/if}
+      {:else}{@render icon("download")}Copy {selectedGames.length || ""} game{selectedGames.length === 1 ? "" : "s"} {@render key("Ctrl ↵")}{/if}
     </button>
   </footer>
 </div>
@@ -676,7 +1128,7 @@
     content: ""; width: 4px; height: 8px; border: solid white; border-width: 0 2px 2px 0;
     transform: translateY(-1px) rotate(45deg); opacity: 0;
   }
-  input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+  input[type="checkbox"]:checked { background: var(--g, var(--accent)); border-color: var(--g, var(--accent)); animation: pop 0.2s ease-out; }
   input[type="checkbox"]:checked::after { opacity: 1; }
 
   button {
@@ -718,6 +1170,15 @@
   .seg button + button { border-left: 1px solid var(--line); }
   .seg button:hover:not(.active) { background: var(--panel-2); color: var(--text); }
   .seg button.active { background: var(--panel-3); color: var(--text); }
+  .kbd {
+    position: absolute; right: 9px; padding: 0 6px; line-height: 18px; border-radius: 4px; pointer-events: none;
+    font: 500 11px ui-monospace, "Cascadia Code", monospace; color: var(--faint); border: 1px solid var(--line);
+  }
+  .kbd.go, .kbd.hidden { display: none; }
+  .field:focus-within .kbd.idle { display: none; }
+  .field:focus-within .kbd.go { display: inline-block; }
+  .search > input:not([type="checkbox"]) { padding-right: 84px; }
+  .seg button.new-filter { color: var(--accent-text); }
   .count { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--faint); }
   .seg button.active .count { color: var(--dim); }
   .check { display: flex; align-items: center; gap: 8px; color: var(--dim); cursor: pointer; user-select: none; font-size: 13px; }
@@ -728,12 +1189,60 @@
     flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; margin: 0 20px;
     border: 1px solid var(--line); border-radius: var(--radius); background: color-mix(in srgb, var(--panel) 90%, transparent);
   }
+  /* Spotlight banner */
+  .banner {
+    position: relative; flex-shrink: 0; height: 132px; overflow: hidden;
+    background: var(--panel-2); border-bottom: 1px solid var(--line);
+  }
+  .banner img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 35%; }
+  .banner::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(90deg, rgb(12 12 14 / 0.88), rgb(12 12 14 / 0.45) 45%, transparent 80%);
+    box-shadow: inset 0 -2px 0 var(--g, var(--accent));
+    transition: box-shadow 0.3s ease;
+  }
+  .banner-info { position: absolute; left: 18px; right: 18px; bottom: 14px; z-index: 1; }
+  .banner-text { position: absolute; left: 0; bottom: 0; max-width: 100%; }
+  .banner-name {
+    font-family: var(--display); font-size: 30px; font-weight: 600; line-height: 1.05; color: white;
+    text-shadow: 0 2px 8px rgb(0 0 0 / 0.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .banner-meta { display: flex; gap: 10px; align-items: center; margin-top: 4px; font-size: 12px; color: rgb(255 255 255 / 0.75); }
+  .banner-status { padding: 0 6px; line-height: 18px; border-radius: 4px; color: var(--g, var(--accent-text)); background: color-mix(in srgb, var(--g, var(--accent)) 22%, rgb(0 0 0 / 0.4)); }
+  .banner-new { padding: 0 6px; line-height: 18px; border-radius: 4px; color: #141418; font-weight: 600; background: var(--g, var(--accent-text)); }
+  .banner-status.installed { color: var(--ok); background: color-mix(in srgb, var(--ok) 18%, rgb(0 0 0 / 0.4)); }
+
   .rows { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
   .list-head {
     flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 8px 26px 8px 16px;
     border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim);
   }
   .list-head .check { font-size: 12px; }
+  .head-right { display: flex; align-items: center; gap: 16px; }
+  .keys { display: flex; align-items: center; gap: 5px; color: var(--faint); }
+  .keys .key + .key, .keys .key { margin-left: 4px; }
+  @media (max-width: 900px) { .keys { display: none; } }
+  /* Small key-cap hint */
+  .key {
+    display: inline-block; padding: 0 5px; min-width: 18px; line-height: 16px; text-align: center; border-radius: 4px;
+    font: 500 10.5px ui-monospace, "Cascadia Code", monospace; color: var(--dim);
+    border: 1px solid var(--line-strong); border-bottom-width: 2px; vertical-align: 1px;
+  }
+  button.primary .key { color: rgb(255 255 255 / 0.85); border-color: rgb(255 255 255 / 0.35); margin-left: 4px; }
+  .sum-main .key { font-family: ui-monospace, monospace; margin-left: 2px; }
+  .list { position: relative; }
+  .jump-letter {
+    position: absolute; left: 50%; top: 50%; z-index: 5; transform: translate(-50%, -50%);
+    width: 96px; height: 96px; display: grid; place-items: center; border-radius: 14px; pointer-events: none;
+    font-family: var(--display); font-size: 60px; font-weight: 600; color: white;
+    background: rgb(20 20 24 / 0.82); border: 1px solid var(--line-strong); box-shadow: 0 10px 30px rgb(0 0 0 / 0.4);
+  }
+  /* Keyboard cursor */
+  .game.cursor { box-shadow: inset 0 0 0 2px var(--g, var(--accent)); }
+  .rows.grid .game.cursor { box-shadow: 0 0 0 2px var(--g, var(--accent)); }
+  .list-head.review { padding-top: 5px; padding-bottom: 5px; background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--text); }
+  .review-title strong { font-weight: 600; }
+  button.small { height: 26px; padding: 0 10px; font-size: 12px; }
   .game {
     position: relative; display: grid; grid-template-columns: 16px 120px 1fr auto; gap: 14px; align-items: center;
     padding: 8px 16px; border-bottom: 1px solid var(--line); cursor: pointer;
@@ -741,9 +1250,10 @@
   }
   .game:last-child { border-bottom: none; }
   .game:hover { background: var(--panel-2); }
-  .game.sel { background: color-mix(in srgb, var(--accent) 10%, transparent); }
-  .game.sel:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
-  .game.sel::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+  /* --g is the game's own colour (picked from its art); falls back to the app accent. */
+  .game.sel { background: color-mix(in srgb, var(--g, var(--accent)) 11%, transparent); }
+  .game.sel:hover { background: color-mix(in srgb, var(--g, var(--accent)) 15%, transparent); }
+  .game.sel::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--g, var(--accent)); animation: grow 0.18s ease-out; }
   .thumb {
     position: relative; width: 120px; aspect-ratio: 460 / 215; border-radius: 4px; overflow: hidden;
     background: linear-gradient(100deg, var(--panel-2) 30%, var(--panel-3) 50%, var(--panel-2) 70%) 0 0 / 300% 100%;
@@ -766,10 +1276,10 @@
     transition: border-color 0.12s, background-color 0.1s;
   }
   .rows.grid .game:hover { border-color: var(--line-strong); }
-  .rows.grid .game.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+  .rows.grid .game.sel { border-color: var(--g, var(--accent)); box-shadow: 0 0 0 1px var(--g, var(--accent)); background: color-mix(in srgb, var(--g, var(--accent)) 8%, var(--panel)); }
   .rows.grid .game.sel::before { display: none; }
   .rows.grid .game > input { position: absolute; top: 8px; left: 8px; z-index: 1; background: rgb(0 0 0 / 0.55); border-color: rgb(255 255 255 / 0.6); }
-  .rows.grid .game > input:checked { background: var(--accent); border-color: var(--accent); }
+  .rows.grid .game > input:checked { background: var(--g, var(--accent)); border-color: var(--g, var(--accent)); }
   .rows.grid .thumb { grid-area: thumb; width: 100%; border-radius: 0; }
   /* Name and badges sit over the bottom of the art, like a game launcher */
   .rows.grid .meta {
@@ -788,6 +1298,7 @@
   .name { font-family: var(--display); font-size: 18px; font-weight: 600; line-height: 1.2; letter-spacing: 0.2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .badges { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
   .badge { font-size: 11px; padding: 0 6px; line-height: 18px; border-radius: 4px; color: var(--dim); background: var(--panel-3); }
+  .badge.new { color: #141418; background: var(--g, var(--accent-text)); font-weight: 600; }
   .badge.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
   .badge.info { color: var(--accent-text); background: color-mix(in srgb, var(--accent) 16%, transparent); }
   .badge.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
@@ -805,22 +1316,32 @@
 
   /* Copy job */
   .job {
+    position: relative; overflow: hidden;
     margin: 12px 20px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
     max-height: 40vh; display: flex; flex-direction: column; gap: 10px;
   }
+  /* The game being copied, faintly behind the panel */
+  .job-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.18; pointer-events: none; }
+  .job > :not(.job-art) { position: relative; }
+  .job.running { border-color: color-mix(in srgb, var(--g, var(--accent)) 45%, var(--line)); transition: border-color 0.4s ease; }
+  .spark { flex-shrink: 0; }
+  .spark polyline { fill: none; stroke: var(--g, var(--accent)); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
   .job-head { display: flex; align-items: center; gap: 12px; }
   .job-head strong { flex: 1; font-family: var(--display); font-size: 19px; font-weight: 600; }
   .job-head button { height: 30px; font-size: 13px; }
   .stat { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
   .bar { height: 6px; background: var(--panel-3); border-radius: 3px; overflow: hidden; }
   .bar.thin { height: 3px; }
-  .bar > div { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+  .bar > div { height: 100%; background: var(--g, var(--accent)); transition: width 0.3s ease, background-color 0.4s ease; }
   .current { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
   .cur-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .current .hint { margin: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .file { font-family: ui-monospace, "Cascadia Code", monospace; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .queue { list-style: none; margin: 0; padding: 8px 0 0; overflow-y: auto; border-top: 1px solid var(--line); }
-  .queue li { display: grid; grid-template-columns: 16px 1fr auto; gap: 10px; align-items: center; padding: 3px 0; font-size: 13px; }
+  .queue li { display: grid; grid-template-columns: 16px 40px 1fr auto; gap: 10px; align-items: center; padding: 3px 6px; margin: 0 -6px; border-radius: 4px; font-size: 13px; }
+  .qthumb { width: 40px; height: 19px; object-fit: cover; border-radius: 2px; }
+  .queue li.pending .qthumb, .queue li.cancelled .qthumb { opacity: 0.4; filter: grayscale(1); }
+  .queue li.done { animation: done-flash 0.9s ease-out; }
   .queue .hint { margin: 0; }
   .qs { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; border: 1.5px solid var(--line-strong); }
   .queue li.active .qs { border: none; }
@@ -842,7 +1363,15 @@
   .disk .used { background: var(--line-strong); }
   .disk .adding { background: var(--accent); transition: width 0.25s ease; }
   .disk.bad .adding { background: var(--bad); }
-  .summary { text-align: right; font-variant-numeric: tabular-nums; line-height: 1.3; }
+  .summary {
+    height: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 0; padding: 4px 10px;
+    text-align: right; font-variant-numeric: tabular-nums; line-height: 1.3;
+    border-color: transparent; background: transparent;
+  }
+  .summary:disabled { opacity: 1; }
+  .summary:hover:not(:disabled) { border-color: var(--line); background: var(--panel-2); }
+  .summary:hover:not(:disabled) .sum-main { text-decoration: underline; text-underline-offset: 3px; }
+  .summary.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
   .sum-main { font-family: var(--display); font-size: 19px; font-weight: 600; line-height: 1.1; }
   .sum-sub { font-size: 12px; color: var(--dim); }
   .summary.bad .sum-sub { color: var(--bad); }
@@ -862,6 +1391,9 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -50% 0; } }
   @keyframes draw { to { stroke-dashoffset: 0; } }
+  @keyframes pop { 50% { transform: scale(1.2); } }
+  @keyframes grow { from { transform: scaleY(0); } }
+  @keyframes done-flash { from { background: color-mix(in srgb, var(--ok) 25%, transparent); } }
   /* Moving the layer (like the old background glows did) damages the whole window every frame. */
   @keyframes repaint { to { transform: translate(24px, 24px); } }
   @media (prefers-reduced-motion: reduce) {

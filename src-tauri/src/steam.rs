@@ -268,11 +268,24 @@ pub fn detect_platform(game_dir: &Path) -> Platform {
 /// landscape images. Newer clients put each image in a hashed subfolder; older ones keep them at
 /// the top level, so both are checked.
 pub fn find_header_image(steamapps: &Path, appid: &str) -> Option<PathBuf> {
-    const PREFERRED: &[&str] = &["library_header.jpg", "header.jpg", "library_capsule.jpg", "library_hero.jpg", "library_600x900.jpg"];
+    find_cached_image(
+        steamapps,
+        appid,
+        &["library_header.jpg", "header.jpg", "library_capsule.jpg", "library_hero.jpg", "library_600x900.jpg"],
+    )
+}
+
+/// The wide banner art Steam shows at the top of a game's library page.
+pub fn find_hero_image(steamapps: &Path, appid: &str) -> Option<PathBuf> {
+    find_cached_image(steamapps, appid, &["library_hero.jpg"])
+}
+
+/// Looks in Steam's art cache on the share for the first of `names` that exists.
+fn find_cached_image(steamapps: &Path, appid: &str, names: &[&str]) -> Option<PathBuf> {
     let dir = steamapps.parent()?.join("appcache").join("librarycache").join(appid);
     let mut folders = vec![dir.clone()];
     folders.extend(fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
-    PREFERRED
+    names
         .iter()
         .find_map(|name| folders.iter().map(|f| f.join(name)).find(|p| p.is_file()))
 }
