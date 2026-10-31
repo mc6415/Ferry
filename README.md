@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="static/logo.svg" width="96" height="96" alt="Steam Sharing icon">
+  <img src="static/logo.svg" width="96" height="96" alt="Ferry icon">
 </p>
 
-<h1 align="center">Steam Sharing</h1>
+<h1 align="center">Ferry</h1>
 
 <p align="center">
-  Copy Steam games from another PC on your network straight into your local Steam library:<br>
-  uncompressed, over SMB, and much faster than Steam's own network transfer.
+  Ferry your Steam games across from another PC on your network, straight into your local Steam<br>
+  library: uncompressed, over SMB, and much faster than Steam's own network transfer.
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/list.webp" alt="Steam Sharing showing a shared library with a banner for the selected game" width="840">
+  <img src="docs/screenshots/list.webp" alt="Ferry showing a shared library with a banner for the selected game" width="840">
 </p>
 
 ## Features
@@ -52,7 +52,7 @@
 
 1. **Share the Steam folder** on the PC that has the games (e.g. as an SMB share called
    `SteamShare`). The Steam root, a library root or the `steamapps` folder all work.
-2. **Download Steam Sharing** for the other PC from [Releases](../../releases/latest):
+2. **Download Ferry** for the other PC from [Releases](../../releases/latest):
    - **Windows:** `.msi` or `-setup.exe`
    - **Linux:** `.AppImage` (any distro), `.deb` (Debian/Ubuntu) or `.rpm` (Fedora)
 3. **Connect to the share:**
@@ -60,6 +60,9 @@
    - **Linux:** mount the share first (file manager, or `/etc/fstab` with `cifs`), then pick the
      mounted folder
 4. **Pick games, copy, and restart Steam.** The games show up as installed.
+
+> **Coming from Steam Sharing?** Ferry is the same app, renamed in v0.4.0. It installs as a
+> separate app, so uninstall Steam Sharing afterwards. You'll need to pick your share again once.
 
 ## Keyboard shortcuts
 

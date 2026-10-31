@@ -10,5 +10,5 @@ fn main() {
         // SAFETY: runs first thing in main, before any other threads exist.
         unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
     }
-    steam_sharing_lib::run()
+    ferry_lib::run()
 }

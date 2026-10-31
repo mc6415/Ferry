@@ -1,40 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Ferry app icon: a ferry carrying a gamepad across the water. -->
   <defs>
-    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="64" y1="64" x2="960" y2="960">
-      <stop offset="0" stop-color="#8b5cf6"/>
-      <stop offset="0.55" stop-color="#c026d3"/>
-      <stop offset="1" stop-color="#ec4899"/>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8d70ff"/>
+      <stop offset="1" stop-color="#6544ee"/>
     </linearGradient>
-    <radialGradient id="shine" cx="0.3" cy="0.15" r="0.8">
-      <stop offset="0" stop-color="#fff" stop-opacity="0.35"/>
-      <stop offset="0.6" stop-color="#fff" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="glyph" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#f5e8ff"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#3b0764" flood-opacity="0.45"/>
-    </filter>
+    <clipPath id="tile-clip">
+      <rect x="64" y="64" width="896" height="896" rx="210"/>
+    </clipPath>
   </defs>
 
   <!-- Tile -->
-  <rect x="64" y="64" width="896" height="896" rx="210" fill="url(#bg)"/>
-  <rect x="64" y="64" width="896" height="896" rx="210" fill="url(#shine)"/>
-  <rect x="65.5" y="65.5" width="893" height="893" rx="208.5" fill="none" stroke="#fff" stroke-opacity="0.18" stroke-width="3"/>
+  <rect x="64" y="64" width="896" height="896" rx="210" fill="url(#tile)"/>
 
-  <!-- Gamepad (d-pad and buttons cut out) -->
-  <g filter="url(#shadow)">
-    <path fill="url(#glyph)" fill-rule="evenodd" transform="translate(30 -60) scale(0.86)"
-      d="M360 420H664C740 420 790 460 806 540L836 680C850 750 800 800 744 784C712 775 690 750 668 720L640 680H384L356 720C334 750 312 775 280 784C224 800 174 750 188 680L218 540C234 460 284 420 360 420ZM352 505h36v37h37v36h-37v37h-36v-37h-37v-36h37zM631 518a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM631 602a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM589 560a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM673 560a23 23 0 1 0 46 0a23 23 0 1 0-46 0z"/>
+  <g clip-path="url(#tile-clip)">
+    <!-- Water: a darker band under the boat -->
+    <path fill="#5333d6" d="M64 712 C 150 680 214 680 300 712 S 450 744 536 712 S 686 680 772 712 S 900 744 960 712 V 960 H 64 Z"/>
+    <!-- Wave lines -->
+    <path fill="none" stroke="#fff" stroke-opacity="0.45" stroke-width="26" stroke-linecap="round"
+      d="M200 806 C 250 786 290 786 340 806 S 430 826 480 806 S 570 786 620 806 S 710 826 760 806 S 820 790 840 798"/>
+    <path fill="none" stroke="#fff" stroke-opacity="0.25" stroke-width="22" stroke-linecap="round"
+      d="M290 878 C 330 862 362 862 402 878 S 474 894 514 878 S 586 862 626 878 S 698 894 738 878"/>
   </g>
 
-  <!-- Transfer badge: tile-coloured ring separates it from the gamepad -->
-  <g filter="url(#shadow)">
-    <circle cx="726" cy="726" r="150" fill="url(#glyph)" stroke="url(#bg)" stroke-width="36" paint-order="stroke"/>
+  <!-- Hull -->
+  <path fill="#fff" d="M196 588 H 828 a 18 18 0 0 1 16.4 25.4 L 790 736 a 28 28 0 0 1 -25.6 16.6 H 259.6 a 28 28 0 0 1 -25.6 -16.6 L 179.6 613.4 a 18 18 0 0 1 16.4 -25.4 Z"/>
+  <!-- Portholes -->
+  <g fill="#6544ee">
+    <circle cx="372" cy="664" r="20"/>
+    <circle cx="512" cy="664" r="20"/>
+    <circle cx="652" cy="664" r="20"/>
   </g>
-  <g fill="none" stroke="url(#bg)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M652 690H800M768 658L800 690L768 722"/>
-    <path d="M800 764H652M684 732L652 764L684 796"/>
-  </g>
+
+  <!-- Gamepad cargo on deck (d-pad and buttons cut out) -->
+  <path fill="#fff" fill-rule="evenodd" transform="translate(204.8 110) scale(0.6)"
+    d="M360 420H664C740 420 790 460 806 540L836 680C850 750 800 800 744 784C712 775 690 750 668 720L640 680H384L356 720C334 750 312 775 280 784C224 800 174 750 188 680L218 540C234 460 284 420 360 420ZM352 505h36v37h37v36h-37v37h-36v-37h-37v-36h37zM631 518a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM631 602a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM589 560a23 23 0 1 0 46 0a23 23 0 1 0-46 0zM673 560a23 23 0 1 0 46 0a23 23 0 1 0-46 0z"/>
 </svg>

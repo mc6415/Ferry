@@ -1,6 +1,6 @@
 {
-  "name": "steam-sharing",
-  "version": "0.3.1",
+  "name": "ferry",
+  "version": "0.4.0",
   "description": "",
   "type": "module",
   "scripts": {
