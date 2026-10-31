@@ -17,7 +17,8 @@ const PARTIAL_SUFFIX: &str = ".sscopy-partial";
 const MTIME_SLACK_SECS: i64 = 2;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+// rename_all only renames the variant tags; rename_all_fields is needed for the fields the UI reads.
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 pub enum Event {
     Progress {
         game_index: usize,
@@ -406,6 +407,28 @@ mod tests {
     fn write(p: &Path, content: &[u8]) {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn events_serialize_with_camel_case_fields() {
+        let e = Event::Progress {
+            game_index: 0,
+            game_count: 2,
+            appid: "42".into(),
+            name: "Test".into(),
+            phase: "copying",
+            bytes_done: 1,
+            bytes_total: 2,
+            files_done: 3,
+            files_total: 4,
+            skipped_files: 0,
+            current_file: "a".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "progress");
+        for key in ["gameIndex", "gameCount", "bytesDone", "bytesTotal", "filesDone", "filesTotal", "skippedFiles", "currentFile"] {
+            assert!(v.get(key).is_some(), "missing {key} in {v}");
+        }
     }
 
     #[test]
