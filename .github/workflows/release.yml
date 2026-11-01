@@ -9,6 +9,8 @@ name: Build & release
 # - tauri.conf.json changed but the version is already released: skips the build.
 # - Manual run (Actions -> Build & release -> Run workflow): rebuilds the current version's
 #   release, e.g. after a failed build.
+# - Release notes come from this version's section in CHANGELOG.md. Without one, they fall back
+#   to GitHub's list of PRs merged since the last release.
 
 on:
   push:
@@ -31,6 +33,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       build: ${{ steps.check.outputs.build }}
+      notes: ${{ steps.notes.outputs.notes }}
     steps:
       - uses: actions/checkout@v7
 
@@ -61,6 +64,26 @@ jobs:
             echo "$TAG is already released, so nothing to build. Bump the version in src-tauri/tauri.conf.json to publish a new release." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Release notes
+        id: notes
+        if: steps.check.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # This version's section of CHANGELOG.md: everything under "## 0.4.3" up to the next "## ".
+          notes=$(awk -v v="${TAG#v}" '$1 == "##" { f = ($2 == v); next } f' CHANGELOG.md 2>/dev/null | sed '/./,$!d')
+          if [ -z "$notes" ]; then
+            echo "No CHANGELOG.md section for $TAG, so using GitHub's list of merged PRs." | tee -a "$GITHUB_STEP_SUMMARY"
+            notes=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" --jq .body)
+          fi
+          {
+            echo "notes<<RELEASE_NOTES_EOF"
+            echo "$notes"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -103,9 +126,15 @@ jobs:
           tagName: ${{ needs.prepare.outputs.tag }}
           releaseName: Ferry ${{ needs.prepare.outputs.tag }}
           releaseBody: |
-            Built from ${{ github.sha }}.
+            ## What's new
+
+            ${{ needs.prepare.outputs.notes }}
+
+            ## Downloads
 
             - **Windows:** `.msi` or `-setup.exe`
             - **Linux:** `.AppImage` (any distro), `.deb` (Debian/Ubuntu) or `.rpm` (Fedora)
+
+            <sub>Built from ${{ github.sha }}.</sub>
           releaseDraft: false
           prerelease: false

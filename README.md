@@ -128,7 +128,10 @@ GitHub Actions (`.github/workflows/release.yml`) builds the Linux and Windows in
 publishes them as a release for the version in `src-tauri/tauri.conf.json`.
 
 - **To publish a release,** bump `version` in `src-tauri/tauri.conf.json` (and `package.json` /
-  `src-tauri/Cargo.toml` to match) and merge to `main`.
+  `src-tauri/Cargo.toml` to match), add a section for it to [`CHANGELOG.md`](CHANGELOG.md), and
+  merge to `main`.
+- **Release notes** come from that version's `CHANGELOG.md` section. If there isn't one, they
+  list the PRs merged since the last release instead.
 - Merges that don't change the version don't build anything.
 - **To rebuild the current release** (e.g. after a failed build), run the workflow manually from
   the Actions tab.
