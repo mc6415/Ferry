@@ -308,6 +308,15 @@
     // A ticked checkbox keeps focus after a click; drop it so Space/arrows drive the list instead.
     if (t instanceof HTMLInputElement && t.type === "checkbox" && (e.key === " " || e.key.startsWith("Arrow"))) t.blur();
 
+    // While Settings is open, Esc closes it and the list shortcuts stay out of the way.
+    if (settingsOpen) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSettings();
+      }
+      return;
+    }
+
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       if (canCopy) startCopy();
@@ -363,6 +372,23 @@
 
   const appWindow = getCurrentWindow();
   let maximized = $state(false);
+
+  // ---- Settings ----
+  const DEFAULT_WORKERS = 4;
+  const WORKER_CHOICES = [1, 2, 4, 8, 16];
+  let workers = $state(WORKER_CHOICES.includes(Number(store.get("workers"))) ? Number(store.get("workers")) : DEFAULT_WORKERS);
+  let settingsOpen = $state(false);
+  let settingsBtn = $state<HTMLButtonElement>();
+
+  function setWorkers(n: number) {
+    workers = n;
+    store.set("workers", String(n));
+  }
+
+  function closeSettings() {
+    settingsOpen = false;
+    settingsBtn?.focus();
+  }
 
   let queue = $state<QueueItem[]>([]);
   let progress = $state<Progress | null>(null);
@@ -507,6 +533,7 @@
     minimize: "M6 12h12",
     maximize: "M6 6h12v12H6z",
     restore: "M8.5 9.5h9v9h-9zM6 15V6.5h9",
+    sliders: "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
   } as const;
 
   const overall = $derived.by(() => {
@@ -599,7 +626,7 @@
     lastSample = null;
     copying = true;
     try {
-      await api.startCopy(steamapps, target, queue.map((q) => q.appid));
+      await api.startCopy(steamapps, target, queue.map((q) => q.appid), workers);
     } catch (e) {
       copying = false;
       error = String(e);
@@ -708,6 +735,7 @@
     <div class="pill" class:on={steamRunning} title={steamRunning ? "Steam only picks up new games when it starts. Quit Steam before copying, or restart it afterwards." : "Steam is not running"}>
       <span class="dot"></span>{steamRunning ? "Steam is running — restart it after copying" : "Steam not running"}
     </div>
+    <button class="settings-btn" class:on={settingsOpen} title="Settings" aria-label="Settings" aria-expanded={settingsOpen} bind:this={settingsBtn} onclick={() => (settingsOpen ? closeSettings() : (settingsOpen = true))}>{@render icon("sliders", 16)}</button>
     <div class="winctl">
       <button title="Minimise" onclick={() => appWindow.minimize()}>{@render icon("minimize", 14)}</button>
       <button title={maximized ? "Restore" : "Maximise"} onclick={() => appWindow.toggleMaximize()}>{@render icon(maximized ? "restore" : "maximize", 13)}</button>
@@ -1004,6 +1032,40 @@
     </button>
   </footer>
 </div>
+  {#if settingsOpen}
+    <div class="scrim" role="presentation" onclick={closeSettings} transition:fade={{ duration: 120 }}></div>
+    <div class="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title" transition:fly={{ y: -6, duration: 160, easing: cubicOut }}>
+      <div class="settings-head">
+        <h2 id="settings-title">Settings</h2>
+        <button class="ghost close-x" title="Close (Esc)" aria-label="Close settings" onclick={closeSettings}>{@render icon("x", 14)}</button>
+      </div>
+
+      <div class="setting">
+        <div class="setting-title">Parallel file copies</div>
+        <p class="setting-help">
+          How many files Ferry copies at the same time. More can speed up games made of lots of small files.
+          Fewer can help when either PC uses a hard drive.
+        </p>
+        <div class="seg" role="radiogroup" aria-label="Parallel file copies">
+          {#each WORKER_CHOICES as n (n)}
+            <button
+              role="radio"
+              aria-checked={workers === n}
+              class:active={workers === n}
+              onclick={() => setWorkers(n)}
+              {@attach (el) => { if (workers === n) el.focus(); }}
+            >{n}{#if n === DEFAULT_WORKERS}<span class="count">default</span>{/if}</button>
+          {/each}
+        </div>
+        <p class="caution">{@render icon("alert", 14)} Best left at {DEFAULT_WORKERS} unless you know what you're doing.</p>
+        {#if copying}<p class="setting-help">Changes apply from the next copy.</p>{/if}
+      </div>
+
+      <div class="settings-foot">
+        <button class="small" disabled={workers === DEFAULT_WORKERS} onclick={() => setWorkers(DEFAULT_WORKERS)}>Reset to default</button>
+      </div>
+    </div>
+  {/if}
   {#if hostOs === "linux"}<div class="repaint" aria-hidden="true"></div>{/if}
 </div>
 
@@ -1088,6 +1150,27 @@
   .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
   .pill.on { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
   .pill.on .dot { background: var(--warn); }
+  .settings-btn { width: 34px; height: 30px; padding: 0; border: none; background: transparent; color: var(--dim); border-radius: 6px; display: grid; place-items: center; }
+  .settings-btn:hover:not(:disabled), .settings-btn.on { background: var(--panel-3); color: var(--text); }
+
+  /* Settings panel */
+  .scrim { position: absolute; inset: 0; z-index: 8; background: rgb(0 0 0 / 0.45); }
+  .settings {
+    position: absolute; z-index: 9; top: 62px; right: 16px; width: min(400px, calc(100% - 32px));
+    background: var(--panel); border: 1px solid var(--line-strong); border-radius: 10px;
+    box-shadow: 0 18px 50px rgb(0 0 0 / 0.5); padding: 16px 18px 14px;
+  }
+  .settings-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .settings-head h2 { margin: 0; font-family: var(--display); font-weight: 600; font-size: 20px; letter-spacing: 0.01em; }
+  .close-x { width: 28px; height: 28px; padding: 0; border: none; display: grid; place-items: center; color: var(--dim); }
+  .setting { padding: 12px 0 4px; border-top: 1px solid var(--line); }
+  .setting-title { font-weight: 600; font-size: 14px; }
+  .setting-help { margin: 4px 0 10px; color: var(--dim); font-size: 13px; line-height: 1.45; }
+  .setting .seg { width: fit-content; }
+  .setting .seg .count { margin-left: 6px; font-size: 11px; }
+  .caution { display: flex; align-items: center; gap: 7px; margin: 10px 0 6px; color: var(--warn); font-size: 12.5px; }
+  .settings-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+
   .winctl { display: flex; gap: 2px; margin-left: 2px; }
   .winctl button { width: 34px; height: 30px; padding: 0; border: none; background: transparent; color: var(--dim); border-radius: 6px; }
   .winctl button:hover:not(:disabled) { background: var(--panel-3); color: var(--text); }
@@ -1171,6 +1254,7 @@
   .seg button + button { border-left: 1px solid var(--line); }
   .seg button:hover:not(.active) { background: var(--panel-2); color: var(--text); }
   .seg button.active { background: var(--panel-3); color: var(--text); }
+  .seg button:focus-visible { outline-offset: -2px; border-radius: 5px; }
   .kbd {
     position: absolute; right: 9px; padding: 0 6px; line-height: 18px; border-radius: 4px; pointer-events: none;
     font: 500 11px ui-monospace, "Cascadia Code", monospace; color: var(--faint); border: 1px solid var(--line);

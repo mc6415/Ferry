@@ -127,7 +127,7 @@ async fn restart_steam(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: String, target_library: String, appids: Vec<String>) -> Result<(), String> {
+fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: String, target_library: String, appids: Vec<String>, workers: Option<usize>) -> Result<(), String> {
     let mut job = state.0.lock().unwrap();
     if job.is_some() {
         return Err("A copy is already running".into());
@@ -138,7 +138,7 @@ fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: Strin
         let report = |e: copy::Event| {
             let _ = app.emit("copy-event", e);
         };
-        copy::run(&PathBuf::from(steamapps), &PathBuf::from(target_library), &appids, &cancel, &report);
+        copy::run(&PathBuf::from(steamapps), &PathBuf::from(target_library), &appids, workers.unwrap_or(copy::DEFAULT_WORKERS), &cancel, &report);
         use tauri::Manager;
         *app.state::<copy::JobState>().0.lock().unwrap() = None;
     });
