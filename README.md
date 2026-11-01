@@ -31,6 +31,9 @@
   where they left off, and updates only copy what changed.
 - **Live progress.** Speed graph, time left, a per-game queue, and progress on your taskbar.
 - **Restart Steam in one click** when the copy finishes, so the new games show up straight away.
+- **Delete local copies** of installed games from the app, e.g. to copy one again. Only the
+  copy on the PC running Ferry is removed, never the share.
+- **Tunable** parallel file copies in Settings, for games made of lots of small files.
 - **Driven entirely from the keyboard** if you like (see below).
 - **List or grid view,** filters for missing, outdated and new games, and a review of your
   selection before you copy.
@@ -95,7 +98,8 @@ Details:
 - There's a free-space check before each game.
 - On Linux the executable bit is restored for ELF binaries and scripts (SMB often drops it).
 - Native Linux builds are flagged when running on Windows, since they won't run there.
-- Files removed from a game on the share are not deleted locally.
+- When re-copying an updated game, files the update removed on the share are left in the local
+  copy.
 - Cover art comes from Steam's art cache on the share, falling back to the Steam CDN.
 
 ## Develop
