@@ -35,6 +35,8 @@ export type CopyEvent =
       filesTotal: number;
       skippedFiles: number;
       currentFile: string;
+      /** Files being copied at once right now. */
+      workers: number;
     }
   | { kind: "gameDone"; appid: string; name: string; ok: boolean; message: string }
   | { kind: "finished"; cancelled: boolean; succeeded: number; failed: number };
@@ -47,8 +49,8 @@ export const api = {
   steamRunning: () => invoke<boolean>("steam_running"),
   restartSteam: () => invoke<void>("restart_steam"),
   hostOs: () => invoke<string>("host_os"),
-  startCopy: (steamapps: string, targetLibrary: string, appids: string[], workers: number, unbuffered: boolean) =>
-    invoke<void>("start_copy", { steamapps, targetLibrary, appids, workers, unbuffered }),
+  startCopy: (steamapps: string, targetLibrary: string, appids: string[], workers: number, unbuffered: boolean, dynamic: boolean) =>
+    invoke<void>("start_copy", { steamapps, targetLibrary, appids, workers, unbuffered, dynamic }),
   cancelCopy: () => invoke<void>("cancel_copy"),
   /** Deletes local copies; `games` is [appid, library] pairs. Resolves to per-game error messages. */
   deleteLocal: (source: string, games: [string, string][]) => invoke<string[]>("delete_local", { source, games }),

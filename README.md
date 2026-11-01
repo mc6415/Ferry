@@ -33,8 +33,9 @@
 - **Restart Steam in one click** when the copy finishes, so the new games show up straight away.
 - **Delete local copies** of installed games from the app, e.g. to copy one again. Only the
   copy on the PC running Ferry is removed, never the share.
-- **Tunable** in Settings: parallel file copies for games made of lots of small files, and
-  unbuffered writes for a steadier speed on big files.
+- **Tunable** in Settings: parallel file copies (4, 8, 16, or Dynamic to tune itself as it
+  copies) for games made of lots of small files, and unbuffered writes for a steadier speed on
+  big files.
 - **Driven entirely from the keyboard** if you like (see below).
 - **List or grid view,** filters for missing, outdated and new games, and a review of your
   selection before you copy.

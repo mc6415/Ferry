@@ -376,12 +376,16 @@
 
   // ---- Settings ----
   const DEFAULT_WORKERS = 4;
-  const WORKER_CHOICES = [1, 2, 4, 8, 16];
-  let workers = $state(WORKER_CHOICES.includes(Number(store.get("workers"))) ? Number(store.get("workers")) : DEFAULT_WORKERS);
+  type Workers = number | "dynamic";
+  const WORKER_CHOICES: Workers[] = [4, 8, 16, "dynamic"];
+  const savedWorkers = store.get("workers");
+  let workers = $state<Workers>(
+    savedWorkers === "dynamic" ? "dynamic" : WORKER_CHOICES.includes(Number(savedWorkers)) ? Number(savedWorkers) : DEFAULT_WORKERS,
+  );
   let settingsOpen = $state(false);
   let settingsBtn = $state<HTMLButtonElement>();
 
-  function setWorkers(n: number) {
+  function setWorkers(n: Workers) {
     workers = n;
     store.set("workers", String(n));
   }
@@ -663,7 +667,7 @@
     lastSample = null;
     copying = true;
     try {
-      await api.startCopy(steamapps, target, queue.map((q) => q.appid), workers, unbuffered);
+      await api.startCopy(steamapps, target, queue.map((q) => q.appid), workers === "dynamic" ? 16 : workers, unbuffered, workers === "dynamic");
     } catch (e) {
       copying = false;
       error = String(e);
@@ -987,6 +991,11 @@
             <svg class="spark" viewBox="0 0 120 26" width="120" height="26" aria-hidden="true"><polyline points={sparkline} /></svg>
           {/if}
           <span class="stat">{formatBytes(speedT.current)}/s</span>
+          {#if progress?.phase === "copying" && progress.workers}
+            <span class="stat" title={workers === "dynamic" ? "Files being copied at once, picked by Dynamic" : "Files being copied at once"}>
+              {progress.workers} at once{workers === "dynamic" ? " (dynamic)" : ""}
+            </span>
+          {/if}
           <span class="stat">{isFinite(overall.eta) ? formatDuration(etaT.current) : "–"} left</span>
           <button class="danger" onclick={() => api.cancelCopy()}>{@render icon("x", 14)}Cancel</button>
         {:else}
@@ -1092,6 +1101,9 @@
           How many files Ferry copies at the same time. More can speed up games made of lots of small files.
           Fewer can help when either PC uses a hard drive. Big files (over 64&nbsp;MB) are copied at most 4 at a time.
         </p>
+        <p class="setting-help">
+          <strong>Dynamic</strong> starts at 4 and adds more while it keeps making the copy faster, up to 16.
+        </p>
         <div class="seg" role="radiogroup" aria-label="Parallel file copies">
           {#each WORKER_CHOICES as n (n)}
             <button
@@ -1100,7 +1112,7 @@
               class:active={workers === n}
               onclick={() => setWorkers(n)}
               {@attach (el) => { if (workers === n) el.focus(); }}
-            >{n}{#if n === DEFAULT_WORKERS}<span class="count">default</span>{/if}</button>
+            >{n === "dynamic" ? "Dynamic" : n}{#if n === DEFAULT_WORKERS}<span class="count">default</span>{/if}</button>
           {/each}
         </div>
         <p class="caution">{@render icon("alert", 14)} Best left at {DEFAULT_WORKERS} unless you know what you're doing.</p>

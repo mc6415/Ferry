@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 /// Files copied at once when the caller doesn't say. More helps games with lots of small
@@ -26,15 +26,88 @@ const ALIGN: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CopyOptions {
-    /// Files copied at once (clamped to 1..=MAX_WORKERS).
+    /// Files copied at once (clamped to 1..=MAX_WORKERS). Ignored when `dynamic` is on.
     pub workers: usize,
     /// Write big files straight to disk, bypassing the OS write cache.
     pub unbuffered: bool,
+    /// Pick the number of workers as the copy runs, by watching the speed (see [`Tuner`]).
+    pub dynamic: bool,
 }
 
 impl Default for CopyOptions {
     fn default() -> Self {
-        Self { workers: DEFAULT_WORKERS, unbuffered: false }
+        Self { workers: DEFAULT_WORKERS, unbuffered: false, dynamic: false }
+    }
+}
+
+/// Worker counts dynamic mode moves between. It starts at the default (4) and never goes lower.
+const DYNAMIC_LEVELS: [usize; 5] = [4, 6, 8, 12, 16];
+/// How often dynamic mode measures the speed and decides.
+const TUNE_WINDOW: Duration = Duration::from_secs(2);
+/// A step up has to beat the speed before it by this much to be kept.
+const TUNE_GAIN: f64 = 1.05;
+/// Windows to wait after a step up didn't help before trying again.
+const TUNE_HOLD: u32 = 5;
+
+/// Hill-climbing worker count for dynamic mode. Fed the copy speed once per window, it tries
+/// one step up the ladder at a time, keeps the step if the speed improved, and otherwise steps
+/// back down and waits a while before trying again (what helps changes as a game moves from big
+/// files to small ones).
+#[derive(Debug)]
+struct Tuner {
+    level: usize,
+    /// Speed at the current level, from the last window that wasn't a trial.
+    baseline: f64,
+    /// The current level is a trial step up, judged at the end of this window.
+    trying: bool,
+    hold: u32,
+}
+
+impl Tuner {
+    fn new() -> Self {
+        // Measure the starting level for one window before trying anything.
+        Self { level: 0, baseline: 0.0, trying: false, hold: 1 }
+    }
+
+    fn workers(&self) -> usize {
+        DYNAMIC_LEVELS[self.level]
+    }
+
+    /// Takes the speed (bytes/s) over the last window and returns the worker count for the next.
+    fn update(&mut self, rate: f64) -> usize {
+        if rate <= 0.0 {
+            // Nothing moved (e.g. opening a burst of files): no information.
+            return self.workers();
+        }
+        if self.trying {
+            self.trying = false;
+            if rate >= self.baseline * TUNE_GAIN {
+                // That step helped: keep it and try the next one straight away.
+                self.baseline = rate;
+                self.try_step_up();
+            } else {
+                self.level -= 1;
+                self.hold = TUNE_HOLD;
+            }
+        } else {
+            self.baseline = rate;
+            if self.hold > 0 {
+                self.hold -= 1;
+            } else {
+                self.try_step_up();
+            }
+        }
+        self.workers()
+    }
+
+    fn try_step_up(&mut self) {
+        if self.level + 1 < DYNAMIC_LEVELS.len() {
+            self.level += 1;
+            self.trying = true;
+        } else {
+            // At the top: re-check from time to time that it's still worth it.
+            self.hold = TUNE_HOLD;
+        }
     }
 }
 const PARTIAL_SUFFIX: &str = ".sscopy-partial";
@@ -57,6 +130,8 @@ pub enum Event {
         files_total: usize,
         skipped_files: usize,
         current_file: String,
+        /// Files being copied at once right now (changes over time with dynamic workers).
+        workers: usize,
     },
     GameDone {
         appid: String,
@@ -159,7 +234,7 @@ fn copy_game_inner(
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) -> Result<String, CopyError> {
-    let progress = |phase: &'static str, bytes_done, bytes_total, files_done, files_total, skipped_files, current_file: String| {
+    let progress = |phase: &'static str, bytes_done, bytes_total, files_done, files_total, skipped_files, current_file: String, workers| {
         report(Event::Progress {
             game_index: ctx.index,
             game_count: ctx.count,
@@ -172,6 +247,7 @@ fn copy_game_inner(
             files_total,
             skipped_files,
             current_file,
+            workers,
         })
     };
 
@@ -186,7 +262,7 @@ fn copy_game_inner(
         }
 
     // 1. Scan source and work out what actually needs copying.
-    progress("scanning", 0, 0, 0, 0, 0, String::new());
+    progress("scanning", 0, 0, 0, 0, 0, String::new(), 0);
     let mut dirs = Vec::new();
     let mut links = Vec::new();
     let mut to_copy = Vec::new();
@@ -217,7 +293,7 @@ fn copy_game_inner(
                 to_copy.push(item);
             }
             if (to_copy.len() + skipped).is_multiple_of(500) {
-                progress("scanning", 0, 0, 0, to_copy.len() + skipped, skipped, String::new());
+                progress("scanning", 0, 0, 0, to_copy.len() + skipped, skipped, String::new(), 0);
             }
         }
     }
@@ -251,7 +327,10 @@ fn copy_game_inner(
     //    worker. Big files go to at most BIG_FILE_WORKERS workers; the rest only take small ones.
     to_copy.sort_by_key(|f| std::cmp::Reverse(f.size));
     let (big, small) = to_copy.split_at(to_copy.partition_point(|f| f.size >= BIG_FILE));
-    let workers = opts.workers;
+    // Dynamic mode starts every thread it might want and lets `limit` of them copy at a time.
+    let mut tuner = opts.dynamic.then(Tuner::new);
+    let workers = if opts.dynamic { DYNAMIC_LEVELS[DYNAMIC_LEVELS.len() - 1] } else { opts.workers };
+    let limit = AtomicUsize::new(tuner.as_ref().map_or(workers, Tuner::workers));
     let big_workers = workers.min(BIG_FILE_WORKERS);
     let next_big = AtomicUsize::new(0);
     let next_small = AtomicUsize::new(0);
@@ -262,7 +341,8 @@ fn copy_game_inner(
     let stop = AtomicBool::new(false);
     let workers_left = AtomicUsize::new(workers);
 
-    let worker = |takes_big: bool| {
+    let worker = |index: usize| {
+        let takes_big = index < big_workers;
         // Aligned so it can be used for unbuffered writes.
         let mut store = vec![0u8; BUF_SIZE + ALIGN];
         let off = store.as_ptr().align_offset(ALIGN);
@@ -270,6 +350,16 @@ fn copy_game_inner(
         loop {
             if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                 break;
+            }
+            if index >= limit.load(Ordering::Relaxed) {
+                // Parked by dynamic mode: wait to be let back in, or leave once the work's all taken.
+                let small_gone = next_small.load(Ordering::Relaxed) >= small.len();
+                let big_gone = !takes_big || next_big.load(Ordering::Relaxed) >= big.len();
+                if small_gone && big_gone {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
             }
             let item = takes_big
                 .then(|| big.get(next_big.fetch_add(1, Ordering::Relaxed)))
@@ -296,19 +386,30 @@ fn copy_game_inner(
     std::thread::scope(|s| {
         for w in 0..workers {
             let worker = &worker;
-            s.spawn(move || worker(w < big_workers));
+            s.spawn(move || worker(w));
         }
-        // Progress reporter
+        // Progress reporter, and the dynamic mode's tuner.
+        let mut window_start = (Instant::now(), 0u64);
         loop {
             let done = workers_left.load(Ordering::Relaxed) == 0;
+            let bytes = bytes_done.load(Ordering::Relaxed);
+            if let Some(t) = tuner.as_mut() {
+                let elapsed = window_start.0.elapsed();
+                if elapsed >= TUNE_WINDOW {
+                    let rate = (bytes - window_start.1) as f64 / elapsed.as_secs_f64();
+                    limit.store(t.update(rate), Ordering::Relaxed);
+                    window_start = (Instant::now(), bytes);
+                }
+            }
             progress(
                 "copying",
-                bytes_done.load(Ordering::Relaxed),
+                bytes,
                 bytes_total,
                 files_done.load(Ordering::Relaxed) + skipped,
                 files_total,
                 skipped,
                 current.lock().unwrap().clone(),
+                limit.load(Ordering::Relaxed).min(workers),
             );
             if done {
                 break;
@@ -326,7 +427,7 @@ fn copy_game_inner(
 
     // 5. Depot manifests (lets Steam validate/patch without a full verify), then the app manifest
     //    last so Steam never sees a half-copied game as installed.
-    progress("finishing", bytes_total, bytes_total, files_total, files_total, skipped, manifest_name.to_string());
+    progress("finishing", bytes_total, bytes_total, files_total, files_total, skipped, manifest_name.to_string(), 0);
     let dst_cache = dst_apps.join("depotcache");
     for (depot, mid) in &manifest.depots {
         let fname = format!("{depot}_{mid}.manifest");
@@ -533,6 +634,7 @@ mod tests {
             files_total: 4,
             skipped_files: 0,
             current_file: "a".into(),
+            workers: 4,
         };
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "progress");
@@ -613,7 +715,7 @@ mod tests {
 
         let events = Mutex::new(Vec::new());
         let report = |e: Event| events.lock().unwrap().push(e);
-        let opts = CopyOptions { workers: 16, unbuffered: true };
+        let opts = CopyOptions { workers: 16, unbuffered: true, dynamic: false };
         run(&apps, dst.path(), &["7".into()], opts, &AtomicBool::new(false), &report);
 
         let out = dst.path().join("steamapps/common/Mixed");
@@ -623,6 +725,84 @@ mod tests {
             assert_eq!(fs::read(out.join(format!("small/{i}.dat"))).unwrap(), pattern(i * 97));
         }
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, Event::GameDone { ok: true, .. })));
+    }
+
+    /// Runs the tuner against a made-up "speed for N workers" curve and returns the worker
+    /// count it used in each window.
+    fn simulate(windows: usize, speed: impl Fn(usize) -> f64) -> Vec<usize> {
+        let mut t = Tuner::new();
+        let mut used = Vec::new();
+        let mut w = t.workers();
+        for _ in 0..windows {
+            used.push(w);
+            w = t.update(speed(w));
+        }
+        used
+    }
+
+    fn share_at(used: &[usize], n: usize) -> f64 {
+        used.iter().filter(|&&w| w == n).count() as f64 / used.len() as f64
+    }
+
+    #[test]
+    fn tuner_climbs_to_where_speed_stops_improving() {
+        // Faster with every worker up to 8, flat after that.
+        let used = simulate(200, |w| w.min(8) as f64 * 100.0);
+        assert!(share_at(&used, 8) > 0.6, "should mostly sit at 8: {used:?}");
+        assert!(used.iter().all(|&w| w <= 12), "never needs 16: {used:?}");
+    }
+
+    #[test]
+    fn tuner_stays_low_when_more_workers_dont_help() {
+        let used = simulate(200, |_| 500.0);
+        assert!(share_at(&used, 4) > 0.75, "{used:?}");
+        assert!(used.iter().all(|&w| w <= 6), "only ever tries one step up: {used:?}");
+    }
+
+    #[test]
+    fn tuner_backs_off_when_more_workers_hurt() {
+        let used = simulate(200, |w| 1000.0 / w as f64);
+        assert!(share_at(&used, 4) > 0.75, "{used:?}");
+    }
+
+    #[test]
+    fn tuner_reaches_the_top_when_it_keeps_helping() {
+        let used = simulate(50, |w| w as f64 * 100.0);
+        assert_eq!(*used.last().unwrap(), 16);
+    }
+
+    #[test]
+    fn tuner_ignores_windows_with_no_progress() {
+        let mut t = Tuner::new();
+        let before = format!("{t:?}");
+        assert_eq!(t.update(0.0), 4);
+        assert_eq!(format!("{t:?}"), before);
+    }
+
+    #[test]
+    fn dynamic_copy_finishes_and_parked_workers_exit() {
+        let src = disk_tempdir();
+        let dst = disk_tempdir();
+        let apps = src.path().join("steamapps");
+        write(&apps.join("appmanifest_8.acf"), br#""AppState" { "appid" "8" "name" "Dyn" "installdir" "Dyn" }"#);
+        for i in 0..300 {
+            write(&apps.join(format!("common/Dyn/{i}.dat")), &pattern(i * 53));
+        }
+        fs::create_dir_all(dst.path().join("steamapps")).unwrap();
+
+        let events = Mutex::new(Vec::new());
+        let report = |e: Event| events.lock().unwrap().push(e);
+        let opts = CopyOptions { dynamic: true, ..CopyOptions::default() };
+        // Would hang here if parked workers never left.
+        run(&apps, dst.path(), &["8".into()], opts, &AtomicBool::new(false), &report);
+
+        for i in 0..300 {
+            assert_eq!(fs::read(dst.path().join(format!("steamapps/common/Dyn/{i}.dat"))).unwrap(), pattern(i * 53));
+        }
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| matches!(e, Event::GameDone { ok: true, .. })));
+        // Starts with 4 copying, not all 16 threads.
+        assert!(ev.iter().any(|e| matches!(e, Event::Progress { phase: "copying", workers: 4, .. })));
     }
 
     #[test]
