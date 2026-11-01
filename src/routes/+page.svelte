@@ -309,10 +309,11 @@
     if (t instanceof HTMLInputElement && t.type === "checkbox" && (e.key === " " || e.key.startsWith("Arrow"))) t.blur();
 
     // While Settings is open, Esc closes it and the list shortcuts stay out of the way.
-    if (settingsOpen) {
+    if (settingsOpen || deleteOpen) {
       if (e.key === "Escape") {
         e.preventDefault();
-        closeSettings();
+        if (settingsOpen) closeSettings();
+        else closeDelete();
       }
       return;
     }
@@ -426,6 +427,34 @@
   const selectedGames = $derived(games.filter((g) => selected.has(g.appid)));
   const selectedBytes = $derived(selectedGames.reduce((n, g) => n + g.sizeOnDisk, 0));
   const notEnoughSpace = $derived(targetLib?.free_bytes != null && selectedBytes > targetLib.free_bytes);
+  // ---- Deleting local copies (handy for re-testing a copy) ----
+  const installedSelected = $derived(selectedGames.filter((g) => g.local));
+  let deleteOpen = $state(false);
+  let deleting = $state(false);
+  let deleteBtn = $state<HTMLButtonElement>();
+
+  function closeDelete() {
+    if (deleting) return;
+    deleteOpen = false;
+    deleteBtn?.focus();
+  }
+
+  async function deleteLocal() {
+    deleting = true;
+    error = "";
+    try {
+      const failed = await api.deleteLocal(steamapps, installedSelected.map((g) => [g.appid, g.local!.library] as [string, string]));
+      if (failed.length) error = `Couldn't delete ${failed.length === 1 ? "a game" : `${failed.length} games`}: ${failed.join("; ")}`;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      deleting = false;
+      deleteOpen = false;
+      loadLibraries();
+      connect();
+    }
+  }
+
   const canCopy = $derived(!copying && selectedGames.length > 0 && !!target && !notEnoughSpace);
   const spotGame = $derived(games.find((g) => g.appid === spotlight) ?? visible[0] ?? null);
   const spotHero = $derived(spotGame ? heroSrc(spotGame.appid) : null);
@@ -533,6 +562,7 @@
     minimize: "M6 12h12",
     maximize: "M6 6h12v12H6z",
     restore: "M8.5 9.5h9v9h-9zM6 15V6.5h9",
+    trash: "M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3",
     sliders: "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
   } as const;
 
@@ -1026,6 +1056,15 @@
       <span class="sum-main">{Math.round(selCountT.current)} selected {@render key("S")}</span>
       <span class="sum-sub">{notEnoughSpace ? "Not enough space" : selectedGames.length ? formatBytes(selBytesT.current) : "Pick games above"}</span>
     </button>
+    {#if installedSelected.length && !copying}
+      <button
+        class="danger delete-local"
+        bind:this={deleteBtn}
+        transition:fade={{ duration: 120 }}
+        onclick={() => (deleteOpen = true)}
+        title="Delete the selected games that are installed on this PC"
+      >{@render icon("trash", 15)}Delete {installedSelected.length} local</button>
+    {/if}
     <button class="primary big" onclick={startCopy} disabled={copying || !selectedGames.length || !target || notEnoughSpace}>
       {#if copying}<span class="spinner"></span>Copying…
       {:else}{@render icon("download")}Copy {selectedGames.length || ""} game{selectedGames.length === 1 ? "" : "s"} {@render key("Ctrl ↵")}{/if}
@@ -1063,6 +1102,32 @@
 
       <div class="settings-foot">
         <button class="small" disabled={workers === DEFAULT_WORKERS} onclick={() => setWorkers(DEFAULT_WORKERS)}>Reset to default</button>
+      </div>
+    </div>
+  {/if}
+  {#if deleteOpen}
+    <div class="scrim" role="presentation" onclick={closeDelete} transition:fade={{ duration: 120 }}></div>
+    <div class="dialog-wrap">
+      <div class="dialog confirm" role="alertdialog" aria-modal="true" aria-labelledby="delete-title" aria-describedby="delete-desc" transition:fly={{ y: 8, duration: 160, easing: cubicOut }}>
+        <h2 id="delete-title">Delete local {installedSelected.length === 1 ? "copy" : "copies"}?</h2>
+        <p id="delete-desc" class="setting-help">
+          This removes {installedSelected.length === 1 ? "this game" : `these ${installedSelected.length} games`} from this PC, so you can copy
+          {installedSelected.length === 1 ? "it" : "them"} again. The shared library isn't touched.
+        </p>
+        <ul class="del-list">
+          {#each installedSelected.slice(0, 6) as g (g.appid)}
+            <li><span>{g.name}</span><span class="count">{formatBytes(g.sizeOnDisk)}</span></li>
+          {/each}
+          {#if installedSelected.length > 6}<li class="more">and {installedSelected.length - 6} more</li>{/if}
+        </ul>
+        <p class="caution">{@render icon("alert", 14)} Saves kept inside a game's own folder are deleted too. Steam Cloud saves{hostOs === "windows" ? " are" : " and Proton prefixes are"} kept.</p>
+        {#if steamRunning}<p class="setting-help">Steam is running. Restart it afterwards so it notices.</p>{/if}
+        <div class="settings-foot">
+          <button onclick={closeDelete} disabled={deleting} {@attach (el) => el.focus()}>Cancel</button>
+          <button class="danger-fill" onclick={deleteLocal} disabled={deleting}>
+            {#if deleting}<span class="spinner"></span>Deleting…{:else}{@render icon("trash", 15)}Delete{/if}
+          </button>
+        </div>
       </div>
     </div>
   {/if}
@@ -1169,7 +1234,23 @@
   .setting .seg { width: fit-content; }
   .setting .seg .count { margin-left: 6px; font-size: 11px; }
   .caution { display: flex; align-items: center; gap: 7px; margin: 10px 0 6px; color: var(--warn); font-size: 12.5px; }
-  .settings-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+  .settings-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+
+  /* Confirm dialog */
+  .dialog-wrap { position: absolute; inset: 0; z-index: 9; display: grid; place-items: center; pointer-events: none; padding: 16px; }
+  .dialog {
+    pointer-events: auto; width: min(440px, 100%);
+    background: var(--panel); border: 1px solid var(--line-strong); border-radius: 10px;
+    box-shadow: 0 18px 50px rgb(0 0 0 / 0.5); padding: 18px 18px 14px;
+  }
+  .dialog h2 { margin: 0 0 6px; font-family: var(--display); font-weight: 600; font-size: 20px; letter-spacing: 0.01em; }
+  .del-list { list-style: none; margin: 0; padding: 6px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); font-size: 13px; }
+  .del-list li { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .del-list li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .del-list .more { color: var(--dim); }
+  button.danger-fill { background: var(--bad); border-color: var(--bad); color: white; font-weight: 600; }
+  button.danger-fill:hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 85%, white); border-color: color-mix(in srgb, var(--bad) 85%, white); }
+  footer .delete-local { height: 40px; }
 
   .winctl { display: flex; gap: 2px; margin-left: 2px; }
   .winctl button { width: 34px; height: 30px; padding: 0; border: none; background: transparent; color: var(--dim); border-radius: 6px; }

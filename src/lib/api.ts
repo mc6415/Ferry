@@ -50,6 +50,8 @@ export const api = {
   startCopy: (steamapps: string, targetLibrary: string, appids: string[], workers: number) =>
     invoke<void>("start_copy", { steamapps, targetLibrary, appids, workers }),
   cancelCopy: () => invoke<void>("cancel_copy"),
+  /** Deletes local copies; `games` is [appid, library] pairs. Resolves to per-game error messages. */
+  deleteLocal: (source: string, games: [string, string][]) => invoke<string[]>("delete_local", { source, games }),
   onCopyEvent: (cb: (e: CopyEvent) => void): Promise<UnlistenFn> =>
     listen<CopyEvent>("copy-event", (e) => cb(e.payload)),
 };
