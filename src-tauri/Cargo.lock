@@ -972,11 +972,12 @@ dependencies = [
 
 [[package]]
 name = "ferry"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "filetime",
  "fs4",
  "gtk",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
