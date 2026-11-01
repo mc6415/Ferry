@@ -47,8 +47,8 @@ export const api = {
   steamRunning: () => invoke<boolean>("steam_running"),
   restartSteam: () => invoke<void>("restart_steam"),
   hostOs: () => invoke<string>("host_os"),
-  startCopy: (steamapps: string, targetLibrary: string, appids: string[]) =>
-    invoke<void>("start_copy", { steamapps, targetLibrary, appids }),
+  startCopy: (steamapps: string, targetLibrary: string, appids: string[], workers: number) =>
+    invoke<void>("start_copy", { steamapps, targetLibrary, appids, workers }),
   cancelCopy: () => invoke<void>("cancel_copy"),
   onCopyEvent: (cb: (e: CopyEvent) => void): Promise<UnlistenFn> =>
     listen<CopyEvent>("copy-event", (e) => cb(e.payload)),

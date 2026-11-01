@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BUF_SIZE: usize = 4 * 1024 * 1024;
-const WORKERS: usize = 4;
+/// Files copied at once when the caller doesn't say. More helps games with lots of small
+/// files over SMB; fewer is kinder to hard drives.
+pub const DEFAULT_WORKERS: usize = 4;
+/// Upper bound on parallel file copies, whatever the caller asks for.
+pub const MAX_WORKERS: usize = 32;
 const PARTIAL_SUFFIX: &str = ".sscopy-partial";
 /// SMB and FAT round timestamps, so allow some slack when deciding a file is unchanged.
 const MTIME_SLACK_SECS: i64 = 2;
@@ -74,9 +78,11 @@ pub fn run(
     source_steamapps: &Path,
     target_library: &Path,
     appids: &[String],
+    workers: usize,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) {
+    let workers = workers.clamp(1, MAX_WORKERS);
     let dst_apps = target_library.join("steamapps");
     let (mut ok, mut failed) = (0, 0);
     for (i, appid) in appids.iter().enumerate() {
@@ -84,7 +90,7 @@ pub fn run(
             break;
         }
         let ctx = GameCtx { index: i, count: appids.len(), appid: appid.clone(), name: appid.clone() };
-        let (name, result) = copy_game(source_steamapps, &dst_apps, ctx, cancel, report);
+        let (name, result) = copy_game(source_steamapps, &dst_apps, ctx, workers, cancel, report);
         let (good, message) = match result {
             Ok(msg) => (true, msg),
             Err(CopyError::Cancelled) => (false, "Cancelled".into()),
@@ -107,6 +113,7 @@ fn copy_game(
     src_apps: &Path,
     dst_apps: &Path,
     mut ctx: GameCtx,
+    workers: usize,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) -> (String, Result<String, CopyError>) {
@@ -117,7 +124,7 @@ fn copy_game(
     };
     ctx.name = manifest.name.clone();
     let name = ctx.name.clone();
-    (name, copy_game_inner(src_apps, dst_apps, &manifest, &manifest_name, &ctx, cancel, report))
+    (name, copy_game_inner(src_apps, dst_apps, &manifest, &manifest_name, &ctx, workers, cancel, report))
 }
 
 fn copy_game_inner(
@@ -126,6 +133,7 @@ fn copy_game_inner(
     manifest: &Manifest,
     manifest_name: &str,
     ctx: &GameCtx,
+    workers: usize,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) -> Result<String, CopyError> {
@@ -225,10 +233,10 @@ fn copy_game_inner(
     let current = Mutex::new(String::new());
     let first_err: Mutex<Option<CopyError>> = Mutex::new(None);
     let stop = AtomicBool::new(false);
-    let workers_left = AtomicUsize::new(WORKERS);
+    let workers_left = AtomicUsize::new(workers);
 
     std::thread::scope(|s| {
-        for _ in 0..WORKERS {
+        for _ in 0..workers {
             s.spawn(|| {
                 let mut buf = vec![0u8; BUF_SIZE];
                 loop {
@@ -450,7 +458,7 @@ mod tests {
         let events = Mutex::new(Vec::new());
         let report = |e: Event| events.lock().unwrap().push(e);
         let cancel = AtomicBool::new(false);
-        run(&apps, dst.path(), &["42".into()], &cancel, &report);
+        run(&apps, dst.path(), &["42".into()], DEFAULT_WORKERS, &cancel, &report);
 
         let out = dst.path().join("steamapps");
         assert_eq!(fs::read(out.join("common/Test Game/data/a.txt")).unwrap(), b"hello");
@@ -467,7 +475,7 @@ mod tests {
 
         // Second run: everything is unchanged so nothing should be copied.
         events.lock().unwrap().clear();
-        run(&apps, dst.path(), &["42".into()], &cancel, &report);
+        run(&apps, dst.path(), &["42".into()], DEFAULT_WORKERS, &cancel, &report);
         let ev = events.lock().unwrap();
         let msg = ev.iter().find_map(|e| match e {
             Event::GameDone { ok: true, message, .. } => Some(message.clone()),
