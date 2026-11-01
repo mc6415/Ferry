@@ -3,6 +3,20 @@
 What's new in each version of Ferry. When a version is released, its section here becomes the
 release notes on GitHub.
 
+## 0.5.0
+
+- Added a **Dynamic** option for **Parallel file copies**. It starts at 4 and adds more while
+  that keeps making the copy faster (up to 16), then backs off when it stops helping. The copy
+  view shows how many files are being copied at once.
+- **Parallel file copies** now offers 4, 8, 16 or Dynamic. If you'd picked 1 or 2, it goes back
+  to 4.
+- Big files (over 64 MB) are now copied at most 4 at a time, whatever the **Parallel file
+  copies** setting. Higher settings only add workers for smaller files, so big games no longer
+  flood the write cache and stall.
+- Added an **Unbuffered writes for big files** setting. It writes big files straight to the
+  disk, skipping the system's write cache, for a steadier speed and lower memory use. Off by
+  default.
+
 ## 0.4.3
 
 - Added deleting the local copies of games from the app. Select installed games and press

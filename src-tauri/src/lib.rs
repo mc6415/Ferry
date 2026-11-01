@@ -126,8 +126,10 @@ async fn restart_steam(app: AppHandle) -> Result<(), String> {
     app.opener().open_url("steam://open/games", None::<&str>).map_err(|e| e.to_string())
 }
 
+// Tauri commands take their arguments individually from the front end.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: String, target_library: String, appids: Vec<String>, workers: Option<usize>) -> Result<(), String> {
+fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: String, target_library: String, appids: Vec<String>, workers: Option<usize>, unbuffered: Option<bool>, dynamic: Option<bool>) -> Result<(), String> {
     let mut job = state.0.lock().unwrap();
     if job.is_some() {
         return Err("A copy is already running".into());
@@ -138,7 +140,12 @@ fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: Strin
         let report = |e: copy::Event| {
             let _ = app.emit("copy-event", e);
         };
-        copy::run(&PathBuf::from(steamapps), &PathBuf::from(target_library), &appids, workers.unwrap_or(copy::DEFAULT_WORKERS), &cancel, &report);
+        let opts = copy::CopyOptions {
+            workers: workers.unwrap_or(copy::DEFAULT_WORKERS),
+            unbuffered: unbuffered.unwrap_or(false),
+            dynamic: dynamic.unwrap_or(false),
+        };
+        copy::run(&PathBuf::from(steamapps), &PathBuf::from(target_library), &appids, opts, &cancel, &report);
         use tauri::Manager;
         *app.state::<copy::JobState>().0.lock().unwrap() = None;
     });

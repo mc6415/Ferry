@@ -3,12 +3,12 @@
 use crate::steam::{self, Manifest};
 use filetime::FileTime;
 use serde::Serialize;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BUF_SIZE: usize = 4 * 1024 * 1024;
 /// Files copied at once when the caller doesn't say. More helps games with lots of small
@@ -16,6 +16,100 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_WORKERS: usize = 4;
 /// Upper bound on parallel file copies, whatever the caller asks for.
 pub const MAX_WORKERS: usize = 32;
+/// Files at least this big count as "big". Big files are never copied more than
+/// `BIG_FILE_WORKERS` at a time (more just floods the write cache), and are the ones written
+/// unbuffered when that's turned on. The other workers stick to smaller files.
+const BIG_FILE: u64 = 64 * 1024 * 1024;
+const BIG_FILE_WORKERS: usize = 4;
+/// Unbuffered writes must line up with the disk's sectors. 4 KiB covers 512 B and 4 KiB sectors.
+const ALIGN: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CopyOptions {
+    /// Files copied at once (clamped to 1..=MAX_WORKERS). Ignored when `dynamic` is on.
+    pub workers: usize,
+    /// Write big files straight to disk, bypassing the OS write cache.
+    pub unbuffered: bool,
+    /// Pick the number of workers as the copy runs, by watching the speed (see [`Tuner`]).
+    pub dynamic: bool,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self { workers: DEFAULT_WORKERS, unbuffered: false, dynamic: false }
+    }
+}
+
+/// Worker counts dynamic mode moves between. It starts at the default (4) and never goes lower.
+const DYNAMIC_LEVELS: [usize; 5] = [4, 6, 8, 12, 16];
+/// How often dynamic mode measures the speed and decides.
+const TUNE_WINDOW: Duration = Duration::from_secs(2);
+/// A step up has to beat the speed before it by this much to be kept.
+const TUNE_GAIN: f64 = 1.05;
+/// Windows to wait after a step up didn't help before trying again.
+const TUNE_HOLD: u32 = 5;
+
+/// Hill-climbing worker count for dynamic mode. Fed the copy speed once per window, it tries
+/// one step up the ladder at a time, keeps the step if the speed improved, and otherwise steps
+/// back down and waits a while before trying again (what helps changes as a game moves from big
+/// files to small ones).
+#[derive(Debug)]
+struct Tuner {
+    level: usize,
+    /// Speed at the current level, from the last window that wasn't a trial.
+    baseline: f64,
+    /// The current level is a trial step up, judged at the end of this window.
+    trying: bool,
+    hold: u32,
+}
+
+impl Tuner {
+    fn new() -> Self {
+        // Measure the starting level for one window before trying anything.
+        Self { level: 0, baseline: 0.0, trying: false, hold: 1 }
+    }
+
+    fn workers(&self) -> usize {
+        DYNAMIC_LEVELS[self.level]
+    }
+
+    /// Takes the speed (bytes/s) over the last window and returns the worker count for the next.
+    fn update(&mut self, rate: f64) -> usize {
+        if rate <= 0.0 {
+            // Nothing moved (e.g. opening a burst of files): no information.
+            return self.workers();
+        }
+        if self.trying {
+            self.trying = false;
+            if rate >= self.baseline * TUNE_GAIN {
+                // That step helped: keep it and try the next one straight away.
+                self.baseline = rate;
+                self.try_step_up();
+            } else {
+                self.level -= 1;
+                self.hold = TUNE_HOLD;
+            }
+        } else {
+            self.baseline = rate;
+            if self.hold > 0 {
+                self.hold -= 1;
+            } else {
+                self.try_step_up();
+            }
+        }
+        self.workers()
+    }
+
+    fn try_step_up(&mut self) {
+        if self.level + 1 < DYNAMIC_LEVELS.len() {
+            self.level += 1;
+            self.trying = true;
+        } else {
+            // At the top: re-check from time to time that it's still worth it.
+            self.hold = TUNE_HOLD;
+        }
+    }
+}
 const PARTIAL_SUFFIX: &str = ".sscopy-partial";
 /// SMB and FAT round timestamps, so allow some slack when deciding a file is unchanged.
 const MTIME_SLACK_SECS: i64 = 2;
@@ -36,6 +130,8 @@ pub enum Event {
         files_total: usize,
         skipped_files: usize,
         current_file: String,
+        /// Files being copied at once right now (changes over time with dynamic workers).
+        workers: usize,
     },
     GameDone {
         appid: String,
@@ -78,11 +174,11 @@ pub fn run(
     source_steamapps: &Path,
     target_library: &Path,
     appids: &[String],
-    workers: usize,
+    opts: CopyOptions,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) {
-    let workers = workers.clamp(1, MAX_WORKERS);
+    let opts = CopyOptions { workers: opts.workers.clamp(1, MAX_WORKERS), ..opts };
     let dst_apps = target_library.join("steamapps");
     let (mut ok, mut failed) = (0, 0);
     for (i, appid) in appids.iter().enumerate() {
@@ -90,7 +186,7 @@ pub fn run(
             break;
         }
         let ctx = GameCtx { index: i, count: appids.len(), appid: appid.clone(), name: appid.clone() };
-        let (name, result) = copy_game(source_steamapps, &dst_apps, ctx, workers, cancel, report);
+        let (name, result) = copy_game(source_steamapps, &dst_apps, ctx, opts, cancel, report);
         let (good, message) = match result {
             Ok(msg) => (true, msg),
             Err(CopyError::Cancelled) => (false, "Cancelled".into()),
@@ -113,7 +209,7 @@ fn copy_game(
     src_apps: &Path,
     dst_apps: &Path,
     mut ctx: GameCtx,
-    workers: usize,
+    opts: CopyOptions,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) -> (String, Result<String, CopyError>) {
@@ -124,20 +220,21 @@ fn copy_game(
     };
     ctx.name = manifest.name.clone();
     let name = ctx.name.clone();
-    (name, copy_game_inner(src_apps, dst_apps, &manifest, &manifest_name, &ctx, workers, cancel, report))
+    (name, copy_game_inner(src_apps, dst_apps, &manifest, &manifest_name, &ctx, opts, cancel, report))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_game_inner(
     src_apps: &Path,
     dst_apps: &Path,
     manifest: &Manifest,
     manifest_name: &str,
     ctx: &GameCtx,
-    workers: usize,
+    opts: CopyOptions,
     cancel: &AtomicBool,
     report: &(dyn Fn(Event) + Sync),
 ) -> Result<String, CopyError> {
-    let progress = |phase: &'static str, bytes_done, bytes_total, files_done, files_total, skipped_files, current_file: String| {
+    let progress = |phase: &'static str, bytes_done, bytes_total, files_done, files_total, skipped_files, current_file: String, workers| {
         report(Event::Progress {
             game_index: ctx.index,
             game_count: ctx.count,
@@ -150,6 +247,7 @@ fn copy_game_inner(
             files_total,
             skipped_files,
             current_file,
+            workers,
         })
     };
 
@@ -164,7 +262,7 @@ fn copy_game_inner(
         }
 
     // 1. Scan source and work out what actually needs copying.
-    progress("scanning", 0, 0, 0, 0, 0, String::new());
+    progress("scanning", 0, 0, 0, 0, 0, String::new(), 0);
     let mut dirs = Vec::new();
     let mut links = Vec::new();
     let mut to_copy = Vec::new();
@@ -195,7 +293,7 @@ fn copy_game_inner(
                 to_copy.push(item);
             }
             if (to_copy.len() + skipped).is_multiple_of(500) {
-                progress("scanning", 0, 0, 0, to_copy.len() + skipped, skipped, String::new());
+                progress("scanning", 0, 0, 0, to_copy.len() + skipped, skipped, String::new(), 0);
             }
         }
     }
@@ -225,9 +323,17 @@ fn copy_game_inner(
         copy_symlink(&src_dir.join(l), &dst_dir.join(l))?;
     }
 
-    // 4. Files, several at a time. Big files first so the tail end isn't one huge file on one worker.
+    // 4. Files, several at a time, biggest first so the tail end isn't one huge file on one
+    //    worker. Big files go to at most BIG_FILE_WORKERS workers; the rest only take small ones.
     to_copy.sort_by_key(|f| std::cmp::Reverse(f.size));
-    let next = AtomicUsize::new(0);
+    let (big, small) = to_copy.split_at(to_copy.partition_point(|f| f.size >= BIG_FILE));
+    // Dynamic mode starts every thread it might want and lets `limit` of them copy at a time.
+    let mut tuner = opts.dynamic.then(Tuner::new);
+    let workers = if opts.dynamic { DYNAMIC_LEVELS[DYNAMIC_LEVELS.len() - 1] } else { opts.workers };
+    let limit = AtomicUsize::new(tuner.as_ref().map_or(workers, Tuner::workers));
+    let big_workers = workers.min(BIG_FILE_WORKERS);
+    let next_big = AtomicUsize::new(0);
+    let next_small = AtomicUsize::new(0);
     let files_done = AtomicUsize::new(0);
     let bytes_done = AtomicU64::new(0);
     let current = Mutex::new(String::new());
@@ -235,43 +341,75 @@ fn copy_game_inner(
     let stop = AtomicBool::new(false);
     let workers_left = AtomicUsize::new(workers);
 
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| {
-                let mut buf = vec![0u8; BUF_SIZE];
-                loop {
-                    if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = to_copy.get(i) else { break };
-                    *current.lock().unwrap() = item.rel.display().to_string();
-                    let r = copy_file(&src_dir.join(&item.rel), &dst_dir.join(&item.rel), item, &mut buf, &bytes_done, cancel, &stop);
-                    match r {
-                        Ok(()) => {
-                            files_done.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            stop.store(true, Ordering::Relaxed);
-                            first_err.lock().unwrap().get_or_insert(e);
-                            break;
-                        }
-                    }
+    let worker = |index: usize| {
+        let takes_big = index < big_workers;
+        // Aligned so it can be used for unbuffered writes.
+        let mut store = vec![0u8; BUF_SIZE + ALIGN];
+        let off = store.as_ptr().align_offset(ALIGN);
+        let buf = &mut store[off..off + BUF_SIZE];
+        loop {
+            if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if index >= limit.load(Ordering::Relaxed) {
+                // Parked by dynamic mode: wait to be let back in, or leave once the work's all taken.
+                let small_gone = next_small.load(Ordering::Relaxed) >= small.len();
+                let big_gone = !takes_big || next_big.load(Ordering::Relaxed) >= big.len();
+                if small_gone && big_gone {
+                    break;
                 }
-                workers_left.fetch_sub(1, Ordering::Relaxed);
-            });
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let item = takes_big
+                .then(|| big.get(next_big.fetch_add(1, Ordering::Relaxed)))
+                .flatten()
+                .or_else(|| small.get(next_small.fetch_add(1, Ordering::Relaxed)));
+            let Some(item) = item else { break };
+            *current.lock().unwrap() = item.rel.display().to_string();
+            let unbuffered = opts.unbuffered && item.size >= BIG_FILE;
+            let r = copy_file(&src_dir.join(&item.rel), &dst_dir.join(&item.rel), item, buf, unbuffered, &bytes_done, cancel, &stop);
+            match r {
+                Ok(()) => {
+                    files_done.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    stop.store(true, Ordering::Relaxed);
+                    first_err.lock().unwrap().get_or_insert(e);
+                    break;
+                }
+            }
         }
-        // Progress reporter
+        workers_left.fetch_sub(1, Ordering::Relaxed);
+    };
+
+    std::thread::scope(|s| {
+        for w in 0..workers {
+            let worker = &worker;
+            s.spawn(move || worker(w));
+        }
+        // Progress reporter, and the dynamic mode's tuner.
+        let mut window_start = (Instant::now(), 0u64);
         loop {
             let done = workers_left.load(Ordering::Relaxed) == 0;
+            let bytes = bytes_done.load(Ordering::Relaxed);
+            if let Some(t) = tuner.as_mut() {
+                let elapsed = window_start.0.elapsed();
+                if elapsed >= TUNE_WINDOW {
+                    let rate = (bytes - window_start.1) as f64 / elapsed.as_secs_f64();
+                    limit.store(t.update(rate), Ordering::Relaxed);
+                    window_start = (Instant::now(), bytes);
+                }
+            }
             progress(
                 "copying",
-                bytes_done.load(Ordering::Relaxed),
+                bytes,
                 bytes_total,
                 files_done.load(Ordering::Relaxed) + skipped,
                 files_total,
                 skipped,
                 current.lock().unwrap().clone(),
+                limit.load(Ordering::Relaxed).min(workers),
             );
             if done {
                 break;
@@ -289,7 +427,7 @@ fn copy_game_inner(
 
     // 5. Depot manifests (lets Steam validate/patch without a full verify), then the app manifest
     //    last so Steam never sees a half-copied game as installed.
-    progress("finishing", bytes_total, bytes_total, files_total, files_total, skipped, manifest_name.to_string());
+    progress("finishing", bytes_total, bytes_total, files_total, files_total, skipped, manifest_name.to_string(), 0);
     let dst_cache = dst_apps.join("depotcache");
     for (depot, mid) in &manifest.depots {
         let fname = format!("{depot}_{mid}.manifest");
@@ -327,6 +465,7 @@ fn copy_file(
     dst: &Path,
     item: &FileItem,
     buf: &mut [u8],
+    unbuffered: bool,
     bytes_done: &AtomicU64,
     cancel: &AtomicBool,
     stop: &AtomicBool,
@@ -334,14 +473,20 @@ fn copy_file(
     let tmp = partial_path(dst);
     let result = (|| {
         let mut input = File::open(src).map_err(|e| io_err(src, e))?;
-        let mut output = File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
+        // Unbuffered if asked and the destination supports it, otherwise a normal write.
+        let (mut output, mut direct) = match unbuffered.then(|| open_unbuffered(&tmp)) {
+            Some(Ok(f)) => (f, true),
+            _ => (File::create(&tmp).map_err(|e| io_err(&tmp, e))?, false),
+        };
+        let mut written = 0u64;
         #[cfg(unix)]
         let mut first_bytes: Option<[u8; 4]> = None;
         loop {
             if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                 return Err(CopyError::Cancelled);
             }
-            let n = input.read(buf).map_err(|e| io_err(src, e))?;
+            // Unbuffered writes need whole sectors, so fill the buffer; only the last chunk is short.
+            let n = if direct { read_full(&mut input, buf) } else { input.read(buf) }.map_err(|e| io_err(src, e))?;
             if n == 0 {
                 break;
             }
@@ -349,7 +494,29 @@ fn copy_file(
             if first_bytes.is_none() && n >= 4 {
                 first_bytes = Some([buf[0], buf[1], buf[2], buf[3]]);
             }
-            output.write_all(&buf[..n]).map_err(|e| io_err(&tmp, e))?;
+            if direct {
+                let aligned = n - n % ALIGN;
+                match output.write_all(&buf[..aligned]) {
+                    Ok(()) => {}
+                    // Some filesystems accept the unbuffered open but not the writes: start over normally.
+                    Err(_) if written == 0 => {
+                        output = File::create(&tmp).map_err(|e| io_err(&tmp, e))?;
+                        direct = false;
+                        output.write_all(&buf[..n]).map_err(|e| io_err(&tmp, e))?;
+                    }
+                    Err(e) => return Err(io_err(&tmp, e)),
+                }
+                if direct && aligned < n {
+                    // The final partial sector goes through a normal handle.
+                    drop(output);
+                    output = OpenOptions::new().append(true).open(&tmp).map_err(|e| io_err(&tmp, e))?;
+                    direct = false;
+                    output.write_all(&buf[aligned..n]).map_err(|e| io_err(&tmp, e))?;
+                }
+            } else {
+                output.write_all(&buf[..n]).map_err(|e| io_err(&tmp, e))?;
+            }
+            written += n as u64;
             bytes_done.fetch_add(n as u64, Ordering::Relaxed);
         }
         drop(output);
@@ -374,6 +541,42 @@ fn copy_file(
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Reads until `buf` is full or the file ends (network reads often return less than asked).
+fn read_full(input: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// Opens `path` for writing without the OS write cache: FILE_FLAG_NO_BUFFERING on Windows (like
+/// robocopy /J), O_DIRECT on Linux. Writes must then be whole, aligned sectors.
+fn open_unbuffered(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        o.custom_flags(FILE_FLAG_NO_BUFFERING);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_DIRECT);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    return Err(io::Error::other("unbuffered writes aren't supported here"));
+    #[cfg(any(windows, target_os = "linux"))]
+    o.open(path)
 }
 
 fn copy_symlink(src: &Path, dst: &Path) -> Result<(), CopyError> {
@@ -431,12 +634,175 @@ mod tests {
             files_total: 4,
             skipped_files: 0,
             current_file: "a".into(),
+            workers: 4,
         };
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["kind"], "progress");
         for key in ["gameIndex", "gameCount", "bytesDone", "bytesTotal", "filesDone", "filesTotal", "skippedFiles", "currentFile"] {
             assert!(v.get(key).is_some(), "missing {key} in {v}");
         }
+    }
+
+    /// A temp dir on a real disk: /tmp is often tmpfs, which doesn't support O_DIRECT.
+    fn disk_tempdir() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&base).unwrap();
+        tempfile::tempdir_in(base).unwrap()
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn item_for(path: &Path) -> FileItem {
+        let meta = fs::metadata(path).unwrap();
+        FileItem {
+            rel: PathBuf::new(),
+            size: meta.len(),
+            mtime: FileTime::from_last_modification_time(&meta),
+            #[cfg(unix)]
+            mode: 0o644,
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn unbuffered_open_and_aligned_write_work_on_disk() {
+        let dir = disk_tempdir();
+        let path = dir.path().join("direct");
+        let mut f = open_unbuffered(&path).expect("unbuffered open");
+        let store = vec![7u8; ALIGN * 3];
+        let off = store.as_ptr().align_offset(ALIGN);
+        f.write_all(&store[off..off + ALIGN * 2]).expect("aligned unbuffered write");
+        drop(f);
+        assert_eq!(fs::metadata(&path).unwrap().len(), (ALIGN * 2) as u64);
+    }
+
+    #[test]
+    fn unbuffered_copy_handles_any_size() {
+        let dir = disk_tempdir();
+        let mut store = vec![0u8; BUF_SIZE + ALIGN];
+        let off = store.as_ptr().align_offset(ALIGN);
+        let buf = &mut store[off..off + BUF_SIZE];
+        // Empty, under a sector, exactly aligned, and several buffers plus an odd tail.
+        for len in [0, 100, ALIGN * 3, BUF_SIZE, 2 * BUF_SIZE + 12345] {
+            let src = dir.path().join(format!("src-{len}"));
+            let dst = dir.path().join(format!("dst-{len}"));
+            let data = pattern(len);
+            fs::write(&src, &data).unwrap();
+            let done = AtomicU64::new(0);
+            let flag = AtomicBool::new(false);
+            copy_file(&src, &dst, &item_for(&src), buf, true, &done, &flag, &flag).unwrap();
+            assert_eq!(fs::read(&dst).unwrap(), data, "contents differ for {len} bytes");
+            assert_eq!(done.load(Ordering::Relaxed), len as u64);
+            assert!(!partial_path(&dst).exists());
+        }
+    }
+
+    #[test]
+    fn copies_mixed_sizes_with_many_workers_unbuffered() {
+        let src = disk_tempdir();
+        let dst = disk_tempdir();
+        let apps = src.path().join("steamapps");
+        write(&apps.join("appmanifest_7.acf"), br#""AppState" { "appid" "7" "name" "Mixed" "installdir" "Mixed" }"#);
+        let big = pattern(BIG_FILE as usize + 5000);
+        write(&apps.join("common/Mixed/big1.pak"), &big);
+        write(&apps.join("common/Mixed/big2.pak"), &big[..BIG_FILE as usize]);
+        for i in 0..200 {
+            write(&apps.join(format!("common/Mixed/small/{i}.dat")), &pattern(i * 97));
+        }
+        fs::create_dir_all(dst.path().join("steamapps")).unwrap();
+
+        let events = Mutex::new(Vec::new());
+        let report = |e: Event| events.lock().unwrap().push(e);
+        let opts = CopyOptions { workers: 16, unbuffered: true, dynamic: false };
+        run(&apps, dst.path(), &["7".into()], opts, &AtomicBool::new(false), &report);
+
+        let out = dst.path().join("steamapps/common/Mixed");
+        assert_eq!(fs::read(out.join("big1.pak")).unwrap(), big);
+        assert_eq!(fs::read(out.join("big2.pak")).unwrap(), &big[..BIG_FILE as usize]);
+        for i in 0..200 {
+            assert_eq!(fs::read(out.join(format!("small/{i}.dat"))).unwrap(), pattern(i * 97));
+        }
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, Event::GameDone { ok: true, .. })));
+    }
+
+    /// Runs the tuner against a made-up "speed for N workers" curve and returns the worker
+    /// count it used in each window.
+    fn simulate(windows: usize, speed: impl Fn(usize) -> f64) -> Vec<usize> {
+        let mut t = Tuner::new();
+        let mut used = Vec::new();
+        let mut w = t.workers();
+        for _ in 0..windows {
+            used.push(w);
+            w = t.update(speed(w));
+        }
+        used
+    }
+
+    fn share_at(used: &[usize], n: usize) -> f64 {
+        used.iter().filter(|&&w| w == n).count() as f64 / used.len() as f64
+    }
+
+    #[test]
+    fn tuner_climbs_to_where_speed_stops_improving() {
+        // Faster with every worker up to 8, flat after that.
+        let used = simulate(200, |w| w.min(8) as f64 * 100.0);
+        assert!(share_at(&used, 8) > 0.6, "should mostly sit at 8: {used:?}");
+        assert!(used.iter().all(|&w| w <= 12), "never needs 16: {used:?}");
+    }
+
+    #[test]
+    fn tuner_stays_low_when_more_workers_dont_help() {
+        let used = simulate(200, |_| 500.0);
+        assert!(share_at(&used, 4) > 0.75, "{used:?}");
+        assert!(used.iter().all(|&w| w <= 6), "only ever tries one step up: {used:?}");
+    }
+
+    #[test]
+    fn tuner_backs_off_when_more_workers_hurt() {
+        let used = simulate(200, |w| 1000.0 / w as f64);
+        assert!(share_at(&used, 4) > 0.75, "{used:?}");
+    }
+
+    #[test]
+    fn tuner_reaches_the_top_when_it_keeps_helping() {
+        let used = simulate(50, |w| w as f64 * 100.0);
+        assert_eq!(*used.last().unwrap(), 16);
+    }
+
+    #[test]
+    fn tuner_ignores_windows_with_no_progress() {
+        let mut t = Tuner::new();
+        let before = format!("{t:?}");
+        assert_eq!(t.update(0.0), 4);
+        assert_eq!(format!("{t:?}"), before);
+    }
+
+    #[test]
+    fn dynamic_copy_finishes_and_parked_workers_exit() {
+        let src = disk_tempdir();
+        let dst = disk_tempdir();
+        let apps = src.path().join("steamapps");
+        write(&apps.join("appmanifest_8.acf"), br#""AppState" { "appid" "8" "name" "Dyn" "installdir" "Dyn" }"#);
+        for i in 0..300 {
+            write(&apps.join(format!("common/Dyn/{i}.dat")), &pattern(i * 53));
+        }
+        fs::create_dir_all(dst.path().join("steamapps")).unwrap();
+
+        let events = Mutex::new(Vec::new());
+        let report = |e: Event| events.lock().unwrap().push(e);
+        let opts = CopyOptions { dynamic: true, ..CopyOptions::default() };
+        // Would hang here if parked workers never left.
+        run(&apps, dst.path(), &["8".into()], opts, &AtomicBool::new(false), &report);
+
+        for i in 0..300 {
+            assert_eq!(fs::read(dst.path().join(format!("steamapps/common/Dyn/{i}.dat"))).unwrap(), pattern(i * 53));
+        }
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| matches!(e, Event::GameDone { ok: true, .. })));
+        // Starts with 4 copying, not all 16 threads.
+        assert!(ev.iter().any(|e| matches!(e, Event::Progress { phase: "copying", workers: 4, .. })));
     }
 
     #[test]
@@ -458,7 +824,7 @@ mod tests {
         let events = Mutex::new(Vec::new());
         let report = |e: Event| events.lock().unwrap().push(e);
         let cancel = AtomicBool::new(false);
-        run(&apps, dst.path(), &["42".into()], DEFAULT_WORKERS, &cancel, &report);
+        run(&apps, dst.path(), &["42".into()], CopyOptions::default(), &cancel, &report);
 
         let out = dst.path().join("steamapps");
         assert_eq!(fs::read(out.join("common/Test Game/data/a.txt")).unwrap(), b"hello");
@@ -475,7 +841,7 @@ mod tests {
 
         // Second run: everything is unchanged so nothing should be copied.
         events.lock().unwrap().clear();
-        run(&apps, dst.path(), &["42".into()], DEFAULT_WORKERS, &cancel, &report);
+        run(&apps, dst.path(), &["42".into()], CopyOptions::default(), &cancel, &report);
         let ev = events.lock().unwrap();
         let msg = ev.iter().find_map(|e| match e {
             Event::GameDone { ok: true, message, .. } => Some(message.clone()),
