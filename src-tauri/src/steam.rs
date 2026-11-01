@@ -237,6 +237,50 @@ pub fn list_games(source: &str) -> Result<(String, Vec<Game>), String> {
     Ok((display_path(&steamapps), games))
 }
 
+/// Removes a game from a local Steam library: the app manifest first (so Steam never sees an
+/// installed game with missing files), then its install folder and depot manifests.
+/// Proton prefixes, shader caches and cloud saves are left alone.
+///
+/// Refuses anything that isn't one of this PC's Steam libraries, and never touches the share.
+pub fn delete_local(source: &str, library: &str, appid: &str) -> Result<(), String> {
+    if appid.is_empty() || !appid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid appid '{appid}'"));
+    }
+    let lib = fs::canonicalize(library).map_err(|e| format!("{library}: {e}"))?;
+    if !local_libraries().iter().any(|l| fs::canonicalize(&l.path).ok().as_ref() == Some(&lib)) {
+        return Err(format!("{library} isn't one of this PC's Steam libraries"));
+    }
+    let apps = lib.join("steamapps");
+    if let Ok(src) = resolve_steamapps(source).and_then(|p| fs::canonicalize(p).map_err(|e| e.to_string()))
+        && src == fs::canonicalize(&apps).unwrap_or_default()
+    {
+        return Err("Refusing to delete from the shared library".into());
+    }
+    remove_game(&apps, appid)
+}
+
+/// The deleting part of [`delete_local`], for an already-checked `steamapps` folder.
+fn remove_game(apps: &Path, appid: &str) -> Result<(), String> {
+    let manifest_path = apps.join(format!("appmanifest_{appid}.acf"));
+    // read_manifest rejects installdirs that could escape `common`.
+    let m = read_manifest(&manifest_path)?;
+    fs::remove_file(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+
+    let dir = apps.join("common").join(&m.installdir);
+    match fs::symlink_metadata(&dir) {
+        // A symlinked install folder: remove the link, not what it points at.
+        Ok(md) if md.file_type().is_symlink() => fs::remove_file(&dir),
+        Ok(_) => fs::remove_dir_all(&dir),
+        Err(_) => Ok(()),
+    }
+    .map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    for (depot, mid) in &m.depots {
+        let _ = fs::remove_file(apps.join("depotcache").join(format!("{depot}_{mid}.manifest")));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -338,5 +382,54 @@ mod real_tests {
         println!("art found for {with_art}/{}", games.len());
         for g in &games { if super::find_header_image(std::path::Path::new(&apps), &g.appid).is_none() { println!("  missing {} {}", g.appid, g.name); } }
         println!("libraries: {:?}", super::local_libraries());
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use std::fs;
+
+    fn manifest(appid: &str, installdir: &str) -> String {
+        format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"Test\"\n\t\"installdir\"\t\t\"{installdir}\"\n\
+             \t\"InstalledDepots\"\n\t{{\n\t\t\"43\"\n\t\t{{\n\t\t\t\"manifest\"\t\t\"999\"\n\t\t}}\n\t}}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn removes_manifest_folder_and_depot_manifest_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("steamapps");
+        fs::create_dir_all(apps.join("common/Test Game/data")).unwrap();
+        fs::create_dir_all(apps.join("common/Other Game")).unwrap();
+        fs::create_dir_all(apps.join("depotcache")).unwrap();
+        fs::create_dir_all(apps.join("compatdata/42")).unwrap();
+        fs::write(apps.join("common/Test Game/data/a.bin"), b"x").unwrap();
+        fs::write(apps.join("depotcache/43_999.manifest"), b"x").unwrap();
+        fs::write(apps.join("appmanifest_42.acf"), manifest("42", "Test Game")).unwrap();
+
+        super::remove_game(&apps, "42").unwrap();
+
+        assert!(!apps.join("appmanifest_42.acf").exists());
+        assert!(!apps.join("common/Test Game").exists());
+        assert!(!apps.join("depotcache/43_999.manifest").exists());
+        assert!(apps.join("common/Other Game").is_dir(), "other games are untouched");
+        assert!(apps.join("compatdata/42").is_dir(), "Proton prefix (saves) is kept");
+    }
+
+    #[test]
+    fn refuses_escaping_installdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("steamapps");
+        fs::create_dir_all(apps.join("common")).unwrap();
+        fs::write(apps.join("appmanifest_42.acf"), manifest("42", "..")).unwrap();
+        assert!(super::remove_game(&apps, "42").is_err());
+        assert!(apps.join("common").is_dir());
+        assert!(apps.join("appmanifest_42.acf").exists(), "nothing deleted on refusal");
+    }
+
+    #[test]
+    fn rejects_non_numeric_appid() {
+        assert!(super::delete_local("/nonexistent", "/nonexistent", "../42").is_err());
     }
 }

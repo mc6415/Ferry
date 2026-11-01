@@ -145,6 +145,22 @@ fn start_copy(app: AppHandle, state: State<'_, copy::JobState>, steamapps: Strin
     Ok(())
 }
 
+/// Deletes the local copies of games. Each entry is (appid, library it's installed in).
+/// Returns one error message per game that couldn't be removed.
+#[tauri::command]
+async fn delete_local(state: State<'_, copy::JobState>, source: String, games: Vec<(String, String)>) -> Result<Vec<String>, String> {
+    if state.0.lock().unwrap().is_some() {
+        return Err("Can't delete while a copy is running".into());
+    }
+    blocking(move || {
+        games
+            .iter()
+            .filter_map(|(appid, library)| steam::delete_local(&source, library, appid).err().map(|e| format!("{appid}: {e}")))
+            .collect()
+    })
+    .await
+}
+
 #[tauri::command]
 fn cancel_copy(state: State<'_, copy::JobState>) {
     if let Some(c) = state.0.lock().unwrap().as_ref() {
@@ -202,6 +218,7 @@ pub fn run() {
             restart_steam,
             host_os,
             start_copy,
+            delete_local,
             cancel_copy
         ])
         .run(tauri::generate_context!())
