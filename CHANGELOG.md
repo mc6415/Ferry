@@ -3,6 +3,12 @@
 What's new in each version of Ferry. When a version is released, its section here becomes the
 release notes on GitHub.
 
+## 0.5.1
+
+- Upgrading on Windows is now one step: the installer installs straight over the older version
+  instead of asking you to uninstall it first in a separate window.
+- Windows releases now come as a `-setup.exe` only. The `.msi` is no longer published.
+
 ## 0.5.0
 
 - Added a **Dynamic** option for **Parallel file copies**. It starts at 4 and adds more while

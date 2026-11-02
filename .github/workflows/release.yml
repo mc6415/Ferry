@@ -132,7 +132,7 @@ jobs:
 
             ## Downloads
 
-            - **Windows:** `.msi` or `-setup.exe`
+            - **Windows:** `-setup.exe`
             - **Linux:** `.AppImage` (any distro), `.deb` (Debian/Ubuntu) or `.rpm` (Fedora)
 
             <sub>Built from ${{ github.sha }}.</sub>

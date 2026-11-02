@@ -58,7 +58,7 @@
 1. **Share the Steam folder** on the PC that has the games (e.g. as an SMB share called
    `SteamShare`). The Steam root, a library root or the `steamapps` folder all work.
 2. **Download Ferry** for the other PC from [Releases](../../releases/latest):
-   - **Windows:** `.msi` or `-setup.exe`
+   - **Windows:** `-setup.exe`
    - **Linux:** `.AppImage` (any distro), `.deb` (Debian/Ubuntu) or `.rpm` (Fedora)
 3. **Connect to the share:**
    - **Windows:** enter the network path, e.g. `\\MY-PC\SteamShare`
@@ -121,7 +121,12 @@ npm run tauri build
 ```
 
 Build on each OS you want a binary for: Linux produces `.deb`, `.rpm` and AppImage; Windows
-produces `.msi` and `.exe`.
+produces a `-setup.exe` (NSIS) installer.
+
+> **Windows installer:** `src-tauri/windows/installer.nsi` is a copy of Tauri's NSIS template,
+> changed so upgrading installs straight over the older version instead of asking to uninstall
+> it first. When upgrading `@tauri-apps/cli`, replace it with that version's template and
+> re-apply the change marked `Ferry:`.
 
 > **Linux note:** WebKitGTK 2.54 has bugs with transparent windows, which the rounded window
 > relies on. The app sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` at startup and keeps a
