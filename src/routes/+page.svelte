@@ -3,7 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { Tween } from "svelte/motion";
   import { cubicOut } from "svelte/easing";
-  import { fade, fly } from "svelte/transition";
+  import { fade, fly, slide } from "svelte/transition";
   import { flip } from "svelte/animate";
   import "@fontsource/barlow-condensed/500.css";
   import "@fontsource/barlow-condensed/600.css";
@@ -360,6 +360,21 @@
   let lastHistAt = 0;
 
   let view = $state<"list" | "grid">(store.get("view") === "grid" ? "grid" : "list");
+
+  // ---- Collapsible stats tiles and banner (room for the list on small or scaled-up screens) ----
+  // Until you choose, both start hidden when the window is short, e.g. a handheld at 200%.
+  const shortWindow = typeof window !== "undefined" && window.innerHeight < 720;
+  const savedFlag = (k: string) => (store.get(k) === "" ? shortWindow : store.get(k) === "1");
+  let statsHidden = $state(savedFlag("statsHidden"));
+  let bannerHidden = $state(savedFlag("bannerHidden"));
+  function setStatsHidden(on: boolean) {
+    statsHidden = on;
+    store.set("statsHidden", on ? "1" : "0");
+  }
+  function setBannerHidden(on: boolean) {
+    bannerHidden = on;
+    store.set("bannerHidden", on ? "1" : "0");
+  }
   function setView(v: "list" | "grid") {
     view = v;
     store.set("view", v);
@@ -573,6 +588,9 @@
     minimize: "M6 12h12",
     maximize: "M6 6h12v12H6z",
     restore: "M8.5 9.5h9v9h-9zM6 15V6.5h9",
+    chevronUp: "M6 15l6-6 6 6",
+    chevronDown: "M6 9l6 6 6-6",
+    image: "M4 5h16v14H4zM4 15.5l4.5-4.5 4 4 3-3 4.5 4.5M15.5 9h.01",
     trash: "M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3",
     sliders: "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
   } as const;
@@ -785,7 +803,22 @@
   </header>
 
   <section class="source">
-    <label for="src">Shared library</label>
+    <div class="source-head">
+      <label for="src">Shared library</label>
+      {#if steamapps && !error}
+        {#if statsHidden}
+          <button class="ghost tiny stats-line" onclick={() => setStatsHidden(false)} title="Show the stats">
+            {stats.count} games · {formatBytes(stats.bytes)} · <span class:hot={stats.missing > 0}>{stats.missing} not installed</span> ·
+            <span class:hot={stats.outdated > 0}>{stats.outdated} {stats.outdated === 1 ? "update" : "updates"}</span>
+            {@render icon("chevronDown", 14)}
+          </button>
+        {:else}
+          <button class="ghost tiny" onclick={() => setStatsHidden(true)} title="Hide the stats to make room for the list">
+            Hide stats {@render icon("chevronUp", 14)}
+          </button>
+        {/if}
+      {/if}
+    </div>
     <div class="row">
       <div class="field">
         {@render icon("folder")}
@@ -799,8 +832,8 @@
       </button>
     </div>
     {#if error}<p class="error">{@render icon("alert", 14)}{error}</p>{/if}
-    {#if steamapps && !error}
-      <div class="tiles" title={steamapps}>
+    {#if steamapps && !error && !statsHidden}
+      <div class="tiles" title={steamapps} transition:slide={{ duration: 180 }}>
         <button class="tile" class:on={filter === "all"} onclick={() => (filter = "all")}>
           <span class="num">{Math.round(statCountT.current)}</span><span class="lbl">games on the share</span>
         </button>
@@ -849,9 +882,12 @@
         {/key}
       {/if}
       <!-- Hidden while the copy panel is open (it shows the game's art itself) so the list keeps its room. -->
-      {#if spotGame && !queue.length}
+      {#if spotGame && !queue.length && !bannerHidden}
         {@const sst = status(spotGame)}
-        <div class="banner" style={tintStyle(spotGame.appid)}>
+        <div class="banner" style={tintStyle(spotGame.appid)} transition:slide={{ duration: 180 }}>
+          <button class="banner-hide" onclick={() => setBannerHidden(true)} title="Hide the banner to make room for the list" aria-label="Hide banner">
+            {@render icon("chevronUp", 15)}
+          </button>
           {#key spotGame.appid}
             {#if spotHero}
               <img src={spotHero} alt="" transition:fade={{ duration: 350 }} onerror={() => spotGame && heroFailed(spotGame.appid)} />
@@ -887,6 +923,11 @@
               {#if sort === "name"}{@render key(view === "grid" ? "⇧←→" : "←→")} letter{/if}
               {@render key("Space")} select {@render key("S")} review
             </span>
+            {#if bannerHidden && !queue.length}
+              <button class="ghost tiny" onclick={() => setBannerHidden(false)} title="Show the banner for the highlighted game">
+                {@render icon("image", 14)} Banner
+              </button>
+            {/if}
             {#if view === "list"}<span>Size</span>{/if}
           </span>
         {/if}
@@ -1293,7 +1334,21 @@
 
   /* Source */
   section.source { padding: 16px 20px 12px; }
-  .source > label { display: block; font-size: 13px; font-weight: 500; color: var(--dim); margin-bottom: 6px; }
+  .source-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 24px; margin-bottom: 6px; }
+  .source-head label { font-size: 13px; font-weight: 500; color: var(--dim); }
+  button.tiny { height: 24px; padding: 0 8px; gap: 5px; font-size: 12px; color: var(--dim); border-color: transparent; }
+  button.tiny:hover:not(:disabled) { color: var(--text); }
+  .stats-line { font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .stats-line .hot { color: var(--accent-text); }
+  .banner-hide {
+    position: absolute; top: 8px; right: 8px; z-index: 2; width: 28px; height: 28px; padding: 0;
+    display: grid; place-items: center; border: none; border-radius: 6px;
+    background: rgb(0 0 0 / 0.35); color: rgb(255 255 255 / 0.8); opacity: 0; transition: opacity 0.15s;
+  }
+  .banner:hover .banner-hide, .banner-hide:focus-visible { opacity: 1; }
+  .banner-hide:hover:not(:disabled) { background: rgb(0 0 0 / 0.6); color: white; border: none; }
+  .head-right .tiny { height: 22px; }
+
   .row { display: flex; gap: 8px; }
 
   /* Controls */
@@ -1603,5 +1658,15 @@
     .done-mark circle, .done-mark path { stroke-dashoffset: 0; }
     /* Not decorative: the window disappears without it on Linux. */
     .repaint { animation: repaint 3s linear infinite alternate !important; }
+  }
+
+  /* Short windows (small screens, or high scaling like a handheld at 200%): tighten things up. */
+  @media (max-height: 720px) {
+    header { min-height: 46px; padding-top: 4px; padding-bottom: 4px; }
+    .tagline { display: none; }
+    section.source { padding-top: 10px; padding-bottom: 8px; }
+    .toolbar { padding-bottom: 8px; }
+    .banner { height: 104px; }
+    footer { padding-top: 8px; padding-bottom: 8px; margin-top: 8px; }
   }
 </style>

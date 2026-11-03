@@ -39,6 +39,8 @@
 - **Driven entirely from the keyboard** if you like (see below).
 - **List or grid view,** filters for missing, outdated and new games, and a review of your
   selection before you copy.
+- **Fits small screens:** hide the stats and the game banner to give the list more room, e.g.
+  on a handheld with high display scaling.
 
 <table>
   <tr>
