@@ -3,6 +3,13 @@
 What's new in each version of Ferry. When a version is released, its section here becomes the
 release notes on GitHub.
 
+## 0.5.2
+
+- The stats tiles and the game banner can now be hidden, to make room for the list on small
+  screens or with high display scaling (e.g. a handheld at 200%). Hidden stats shrink to a
+  single line. Ferry remembers your choice.
+- On a short window, both start hidden until you choose, and the layout is a little tighter.
+
 ## 0.5.1
 
 - Upgrading on Windows is now one step: the installer installs straight over the older version
